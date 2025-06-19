@@ -1,0 +1,15 @@
+tensorflow==2.10
+keras
+numpy
+pandas
+opencv-python
+matplotlib
+scipy
+seaborn
+comet-ml
+PyYAML
+tqdm
+torch<=2.5
+torchsummary
+torchvision
+ipykernel
