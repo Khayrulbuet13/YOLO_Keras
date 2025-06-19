@@ -1,0 +1,22 @@
+# Python cache files
+__pycache__/
+*.py[cod]
+
+
+# Dataset directory (large files)
+Dataset/
+
+# Model files and results
+results/
+*.pt
+*.h5
+
+# Cache files
+*.cache
+
+# Secrets
+utils/secrets.json
+
+# IDE settings
+.vscode/
+.history/
