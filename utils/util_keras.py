@@ -556,8 +556,13 @@ class ComputeLoss(Layer):
         print(f"[utils/util.py::ComputeLoss.__call__] After permute - pred_scores shape: {pred_scores.shape}")
         
         
-        hw = tf.cast(tf.shape(x[0])[1:3], dtype=pred_scores.dtype)  # (h, w)
+        # The feature maps have been converted to NCHW format above so the
+        # spatial dimensions are at indices 2 and 3. Use these to compute the
+        # feature map size (height, width) before reversing to (width, height).
+        hw = tf.cast(tf.shape(x[0])[2:4], dtype=pred_scores.dtype)  # (h, w)
         size = tf.reverse(hw, axis=[0]) * self.stride[0]  # (w, h) * stride
+        print(f"[utils/util.py::ComputeLoss.__call__] Size tensor: {size}")
+        
         anchor_points, stride_tensor = make_anchors_tf(x, self.stride, 0.5)
         # Use cast_like for critical operations
         anchor_points = cast_like(anchor_points, outputs)
