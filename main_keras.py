@@ -67,6 +67,9 @@ def train(args, params):
     # Datasets with dtype
     train_dataset = Dataset(train_filenames, args.img_size, params, True, dtype=DTYPE)
     def data_generator():
+        # Mimic PyTorch's collate_fn behaviour. Each object's first column must
+        # contain the index of the image in the current batch so that loss
+        # calculation knows which prediction it belongs to.
         batch_samples = []
         batch_targets = []
         batch_shapes = []
@@ -98,6 +101,15 @@ def train(args, params):
                 print(f"[main_keras.py::data_generator] Target shape: {target.shape}")
                 print(f"[main_keras.py::data_generator] Target sample: {target[:3] if len(target) > 0 else 'None'}")
             
+            # Insert the batch index in the first column like the PyTorch collate
+            # function. This allows loss computation to know which image each
+            # target belongs to after concatenation.
+            batch_index = len(batch_samples)
+            if target.shape[0] > 0:
+                img_idx = tf.fill([tf.shape(target)[0], 1],
+                                   tf.cast(batch_index, target.dtype))
+                target = tf.concat([img_idx, target[:, 1:]], axis=1)
+
             batch_samples.append(sample)
             if target.shape[0] > 0:
                 batch_targets.append(target)
