@@ -78,6 +78,8 @@ class Dataset:
                     label[:, 1] = 1 - label[:, 1]
 
         target = np.zeros((nl, 6))
+        # Column 0 is reserved for the batch index which is filled in the
+        # training data generator. The remaining columns hold label data.
         if nl:
             target[:, 1:] = label
         
