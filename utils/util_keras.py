@@ -560,8 +560,9 @@ class ComputeLoss(Layer):
         # spatial dimensions are at indices 2 and 3. Use these to compute the
         # feature map size (height, width) before reversing to (width, height).
         hw = tf.cast(tf.shape(x[0])[2:4], dtype=pred_scores.dtype)  # (h, w)
-        size = tf.reverse(hw, axis=[0]) * self.stride[0]  # (w, h) * stride
+        size = hw * self.stride[0]  # (h, w) * stride
         print(f"[utils/util.py::ComputeLoss.__call__] Size tensor: {size}")
+        print(f"[utils/util.py::ComputeLoss.__call__] Size tensor: {size.numpy()}")
         
         anchor_points, stride_tensor = make_anchors_tf(x, self.stride, 0.5)
         # Use cast_like for critical operations
