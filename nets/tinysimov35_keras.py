@@ -162,13 +162,27 @@ class YOLO(Model):
             img_size_with_channels = (img_size, img_size, 3)
         else:
             img_size_with_channels = (*img_size, 3)
-        
+
+        # Build layers by running a dummy forward pass
+        dummy = tf.zeros((1, *img_size_with_channels), dtype=self.dtype_)
+        _ = self.head(self.net(dummy), training=True)  # build layers
+
         # Initialize strides
         self.stride = self.calculate_stride(img_size_with_channels)
         self.head.stride = self.stride
-        
-        # Initialize biases
+
+        # Initialize biases now that layers exist
         self.initialize_biases()
+
+        # Debug info about initialized biases and initial logits
+        print("[nets/tinysimov35_keras.YOLO.__init__] Box bias mean:",
+              float(tf.reduce_mean(self.head.box.bias)))
+        print("[nets/tinysimov35_keras.YOLO.__init__] Cls bias mean:",
+              float(tf.reduce_mean(self.head.cls.bias)))
+        logits = self.head(self.net(dummy))
+        print(
+            f"[nets/tinysimov35_keras.YOLO.__init__] Initial logits min/max: {float(tf.reduce_min(logits)):.4f}/{float(tf.reduce_max(logits)):.4f}"
+        )
         
     def call(self, x, training=False):
         features = self.net(x)
@@ -191,10 +205,13 @@ class YOLO(Model):
         # Box bias
         if hasattr(self.head.box, 'bias') and self.head.box.bias is not None:
             self.head.box.bias.assign(tf.ones_like(self.head.box.bias))
+            print("[nets/tinysimov35_keras.initialize_biases] Box bias initialized")
         # Class bias
         if hasattr(self.head.cls, 'bias') and self.head.cls.bias is not None:
             b = self.head.cls.bias
-            b.assign(tf.math.log(5 / self.head.nc / (640 / s) ** 2) * tf.ones_like(b))
+            bias_value = tf.math.log(5 / self.head.nc / (640 / s) ** 2)
+            b.assign(tf.ones_like(b) * tf.cast(bias_value, b.dtype))
+            print("[nets/tinysimov35_keras.initialize_biases] Cls bias initialized")
     
     
     # def initialize_biases(self):
