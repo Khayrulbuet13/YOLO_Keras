@@ -304,8 +304,8 @@ def train(args, params):
             # Save model
             if val_mean_ap > best:
                 best = val_mean_ap
-                model.save_weights(os.path.join(args.save_path, 'best.h5'))
-            model.save_weights(os.path.join(args.save_path, 'last.h5'))
+                model.save_weights(os.path.join(args.save_path, 'best.weights.h5'))
+            model.save_weights(os.path.join(args.save_path, 'last.weights.h5'))
 
     csv_file.close()
 
@@ -375,7 +375,7 @@ def test(args, params, model=None, is_train=False):
 
     # Load model if not provided
     if model is None:
-        model_path = os.path.join(args.save_path, 'best.h5')
+        model_path = os.path.join(args.save_path, 'best.weights.h5')
         model = yolo_v8_s(len(params['names']), img_size=args.img_size)
         model.load_weights(model_path)
 
