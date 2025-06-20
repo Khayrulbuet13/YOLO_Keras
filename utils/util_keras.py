@@ -315,7 +315,9 @@ def non_max_suppression(prediction, conf_threshold=0.25, iou_threshold=0.45):
         else:
             # Single class - get the max confidence
             conf = tf.reduce_max(cls, axis=1, keepdims=True)
-            j = tf.argmax(cls, axis=1, output_type=tf.float32)[:, None]
+            # Argmax should return integer class indices
+            j = tf.argmax(cls, axis=1, output_type=tf.int32)
+            j = tf.cast(j[:, None], tf.float32)
             
             # Filter by confidence threshold
             mask = tf.squeeze(conf > conf_threshold)
@@ -383,6 +385,10 @@ def compute_ap(tp, conf, pred_cls, target_cls, eps=1e-16):
         The average precision
     """
     
+    # Edge cases: no predictions or no targets
+    if len(conf) == 0 or len(target_cls) == 0:
+        return (0, 0, 0, 0, 0, 0)
+
     # Sort by object-ness
     i = np.argsort(-conf)
     tp, conf, pred_cls = tp[i], conf[i], pred_cls[i]
