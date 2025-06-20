@@ -272,7 +272,10 @@ def non_max_suppression(prediction, conf_threshold=0.25, iou_threshold=0.45):
     max_det = 300  # maximum number of detections per image
     max_nms = 30000  # maximum number of boxes into TF NMS
     
-    nc = prediction.shape[1] - 4  # number of classes
+    # nc = prediction.shape[1] - 4  # number of classes
+    # prediction shape is (batch, num_boxes, num_classes + 4)
+    # Use the last dimension to determine number of classes
+    nc = prediction.shape[-1] - 4  # number of classes
     print(f"[utils/util_keras.py::non_max_suppression] Number of classes: {nc}")
     
     
