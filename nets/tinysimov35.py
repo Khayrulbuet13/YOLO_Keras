@@ -213,6 +213,10 @@ class Head(torch.nn.Module):
         s = self.stride[0]
         a.bias.data[:] = 1.0
         b.bias.data[:self.nc] = math.log(5 / self.nc / (640 / s) ** 2)
+        
+        # Debug prints to match Keras version
+        print(f"[nets/tinysimov35.py::initialize_biases] Box bias initialized")
+        print(f"[nets/tinysimov35.py::initialize_biases] Cls bias initialized")
 
 
 class YOLO(torch.nn.Module):
@@ -253,6 +257,23 @@ class YOLO(torch.nn.Module):
 
         self.stride = self.head.stride
         self.head.initialize_biases()
+        
+        # Debug prints to match Keras version
+        box_bias_mean = self.head.box.bias.data.mean().item()
+        cls_bias_mean = self.head.cls.bias.data.mean().item()
+        print(f"[nets/tinysimov35.py::YOLO.__init__] Box bias mean: {box_bias_mean}")
+        print(f"[nets/tinysimov35.py::YOLO.__init__] Cls bias mean: {cls_bias_mean}")
+        
+        # Calculate initial logits range (simulate forward pass with dummy input)
+        with torch.no_grad():
+            dummy_input = torch.zeros(1, 3, h, w)
+            darknet_out = self.net(dummy_input)
+            head_out = self.head(darknet_out)
+            if isinstance(head_out, list):
+                head_out = head_out[0]  # Training mode returns list
+            logits_min = head_out.min().item()
+            logits_max = head_out.max().item()
+            print(f"[nets/tinysimov35.py::YOLO.__init__] Initial logits min/max: {logits_min:.4f}/{logits_max:.4f}")
 
     def forward(self, x):
         x = self.net(x)

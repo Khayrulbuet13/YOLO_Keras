@@ -179,7 +179,7 @@ class YOLO(Model):
               float(tf.reduce_mean(self.head.box.bias)))
         print("[nets/tinysimov35_keras.YOLO.__init__] Cls bias mean:",
               float(tf.reduce_mean(self.head.cls.bias)))
-        logits = self.head(self.net(dummy))
+        logits = self.head(self.net(dummy), training=True)
         print(
             f"[nets/tinysimov35_keras.YOLO.__init__] Initial logits min/max: {float(tf.reduce_min(logits)):.4f}/{float(tf.reduce_max(logits)):.4f}"
         )
