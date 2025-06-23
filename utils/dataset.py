@@ -41,9 +41,9 @@ class Dataset(data.Dataset):
             image, label = self.load_mosaic(index, params)
             # MixUp augmentation
             if random.random() < params['mix_up']:
-                index = random.choice(self.indices)
+                mix_index = random.choice(self.indices)
                 mix_image1, mix_label1 = image, label
-                mix_image2, mix_label2 = self.load_mosaic(index, params)
+                mix_image2, mix_label2 = self.load_mosaic(mix_index, params)
                 image, label = mix_up(mix_image1, mix_label1, mix_image2, mix_label2)
         else:
             # Load image (no resizing here)

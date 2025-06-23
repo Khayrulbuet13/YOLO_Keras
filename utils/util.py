@@ -156,15 +156,10 @@ def visualize_predictions(samples, outputs, gt_boxes, shapes, params, class_colo
     plt.close()
 
 
-def setup_seed():
-    """
-    Setup random seed.
-    """
-    random.seed(0)
-    numpy.random.seed(0)
-    torch.manual_seed(0)
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
+def set_seed(seed=42):
+    random.seed(seed)
+    numpy.random.seed(seed)
+    torch.manual_seed(seed)
 
 
 def setup_multi_processes():
@@ -758,16 +753,42 @@ class ComputeLoss:
         print(f"[utils/util.py::ComputeLoss.assign] target_scores shape: {target_scores.shape}")
 
         # normalize
+        print(f"\n--- [utils/util.py::ComputeLoss.assign] PYTORCH NORMALIZATION DEBUG ---")
+        print(f"[utils/util.py::ComputeLoss.assign] Before normalization - align_metric shape: {align_metric.shape}")
+        print(f"[utils/util.py::ComputeLoss.assign] Before normalization - mask_pos shape: {mask_pos.shape}")
+        print(f"[utils/util.py::ComputeLoss.assign] Before normalization - overlaps shape: {overlaps.shape}")
+        
         align_metric *= mask_pos
+        print(f"[utils/util.py::ComputeLoss.assign] After align_metric *= mask_pos - align_metric shape: {align_metric.shape}")
+        print(f"[utils/util.py::ComputeLoss.assign] After align_metric *= mask_pos - align_metric min: {align_metric.min()}, max: {align_metric.max()}")
+        
         pos_align_metrics = align_metric.amax(axis=-1, keepdim=True)
+        print(f"[utils/util.py::ComputeLoss.assign] pos_align_metrics shape: {pos_align_metrics.shape}")
+        print(f"[utils/util.py::ComputeLoss.assign] pos_align_metrics min: {pos_align_metrics.min()}, max: {pos_align_metrics.max()}")
+        
         pos_overlaps = (overlaps * mask_pos).amax(axis=-1, keepdim=True)
+        print(f"[utils/util.py::ComputeLoss.assign] pos_overlaps shape: {pos_overlaps.shape}")
+        print(f"[utils/util.py::ComputeLoss.assign] pos_overlaps min: {pos_overlaps.min()}, max: {pos_overlaps.max()}")
+        
         norm_align_metric = (align_metric * pos_overlaps / (pos_align_metrics + self.eps)).amax(-2)
+        print(f"[utils/util.py::ComputeLoss.assign] norm_align_metric shape: {norm_align_metric.shape}")
+        print(f"[utils/util.py::ComputeLoss.assign] norm_align_metric min: {norm_align_metric.min()}, max: {norm_align_metric.max()}")
+        
         norm_align_metric = norm_align_metric.unsqueeze(-1)
+        print(f"[utils/util.py::ComputeLoss.assign] After unsqueeze - norm_align_metric shape: {norm_align_metric.shape}")
+        print(f"[utils/util.py::ComputeLoss.assign] After unsqueeze - norm_align_metric min: {norm_align_metric.min()}, max: {norm_align_metric.max()}")
+        
+        print(f"[utils/util.py::ComputeLoss.assign] Before multiplication - target_scores shape: {target_scores.shape}")
+        print(f"[utils/util.py::ComputeLoss.assign] Before multiplication - target_scores sum: {target_scores.sum()}")
+        
         target_scores = target_scores * norm_align_metric
+        print(f"[utils/util.py::ComputeLoss.assign] After multiplication - target_scores shape: {target_scores.shape}")
+        print(f"[utils/util.py::ComputeLoss.assign] After multiplication - target_scores sum: {target_scores.sum()}")
+        print(f"--- [utils/util.py::ComputeLoss.assign] END PYTORCH NORMALIZATION DEBUG ---\n")
+        
         print(f"[utils/util.py::ComputeLoss.assign] Normalized target_scores shape: {target_scores.shape}")
         print(f"[utils/util.py::ComputeLoss.assign] target_scores sum: {target_scores.sum()}")
         
-        print(f"--- [utils/util.py::ComputeLoss.assign] END PYTORCH ASSIGNMENT DEBUG ---\n")
         return target_bboxes, target_scores, fg_mask.bool()
 
     @staticmethod

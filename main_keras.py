@@ -2,6 +2,7 @@ import argparse
 import csv
 import math
 import os
+import random
 import numpy as np
 import tensorflow as tf
 from tensorflow import keras
@@ -26,10 +27,91 @@ from utils.util_keras import (
 # Define global dtype for consistent type handling
 DTYPE = tf.float32  # Central dtype definition (change to float16 for mixed-precision)
 
+# Set consistent random seeds for reproducible results
+RANDOM_SEED = 42
+random.seed(RANDOM_SEED)
+np.random.seed(RANDOM_SEED)
+tf.random.set_seed(RANDOM_SEED)
+print(f"[main_keras.py] Set random seed to {RANDOM_SEED} for reproducible results")
+
 def learning_rate(args, params):
     def fn(epoch):
         return (1 - epoch / args.epochs) * (1.0 - params['lrf']) + params['lrf']
     return fn
+
+class MultiGroupOptimizer:
+    """Custom optimizer that mimics PyTorch's parameter group behavior"""
+    def __init__(self, model, lr0, momentum, weight_decay, nesterov=True):
+        self.lr0 = lr0
+        self.momentum = momentum
+        self.weight_decay = weight_decay
+        self.nesterov = nesterov
+
+        # Group variables by name
+        self.bias_params = set()
+        self.weight_params = set()
+        self.bn_params = set()
+        all_vars = model.trainable_variables
+        for var in all_vars:
+            var_name = var.name.lower()
+            if var_name.endswith('/bias:0'):
+                self.bias_params.add(var.name)
+            elif any(bn in var_name for bn in ['/batch_normalization', '/bn', '/batchnorm']):
+                # All BN variables (gamma, beta, moving_mean, moving_variance)
+                self.bn_params.add(var.name)
+            elif var_name.endswith('/kernel:0'):
+                self.weight_params.add(var.name)
+        # Remove BN weights from weight_params (so they're not double-counted)
+        self.weight_params = self.weight_params - self.bn_params
+
+        # Initialize momentum variables as tf.Variable
+        self.momentum_vars = {}
+        for var in all_vars:
+            self.momentum_vars[var.ref()] = tf.Variable(tf.zeros_like(var), trainable=False)
+
+        self.lr_bias = lr0
+        self.lr_weight = lr0
+        self.lr_bn = lr0
+
+        print(f"[MultiGroupOptimizer] Total trainable variables: {len(all_vars)}")
+        print(f"[MultiGroupOptimizer] Bias params: {len(self.bias_params)}")
+        print(f"[MultiGroupOptimizer] Weight params: {len(self.weight_params)}")
+        print(f"[MultiGroupOptimizer] BatchNorm params: {len(self.bn_params)}")
+        if self.bias_params:
+            print(f"[MultiGroupOptimizer] Sample bias var: {list(self.bias_params)[0]}")
+        if self.weight_params:
+            print(f"[MultiGroupOptimizer] Sample weight var: {list(self.weight_params)[0]}")
+        if self.bn_params:
+            print(f"[MultiGroupOptimizer] Sample BN var: {list(self.bn_params)[0]}")
+
+    def set_learning_rates(self, lr_bias, lr_weight, lr_bn):
+        self.lr_bias = lr_bias
+        self.lr_weight = lr_weight
+        self.lr_bn = lr_bn
+
+    def apply_gradients(self, gradients_and_vars):
+        for grad, var in gradients_and_vars:
+            if grad is None:
+                continue
+            var_name = var.name
+            if var_name in self.bias_params:
+                lr = self.lr_bias
+            elif var_name in self.bn_params:
+                lr = self.lr_bn
+            else:
+                lr = self.lr_weight
+            # Apply weight decay to weights (not bias or batch norm)
+            if var_name in self.weight_params:
+                grad = grad + self.weight_decay * var
+            # Apply momentum using ref() as key
+            momentum_var = self.momentum_vars[var.ref()]
+            momentum_var.assign(self.momentum * momentum_var + grad)
+            # Apply update
+            if self.nesterov:
+                update = self.momentum * momentum_var + grad
+            else:
+                update = momentum_var
+            var.assign_sub(lr * update)
 
 def train(args, params):
     # Initialize with central dtype
@@ -42,17 +124,20 @@ def train(args, params):
     if args.local_rank == 0:
         os.makedirs(args.save_path, exist_ok=True)
     
-    # Optimizer & Scheduler
+    # Optimizer & Scheduler - MATCH PYTORCH BEHAVIOR
     accumulate = max(round(64 / (args.batch_size)), 1)
     params['weight_decay'] *= args.batch_size * accumulate / 64
 
-    optimizer = optimizers.SGD(
-        learning_rate=params['lr0'],
-        momentum=params['momentum'],
+    # Use custom multi-group optimizer to match PyTorch behavior
+    optimizer = MultiGroupOptimizer(
+        model, 
+        params['lr0'], 
+        params['momentum'], 
+        params['weight_decay'], 
         nesterov=True
     )
 
-    lr_scheduler = callbacks.LearningRateScheduler(learning_rate(args, params))
+    lr_func = learning_rate(args, params)
     
     # EMA
     ema = EMA(model) if args.local_rank == 0 else None
@@ -75,6 +160,9 @@ def train(args, params):
         batch_shapes = []
         batch_size = args.batch_size
         
+        # DEBUG: Print mosaic status
+        print(f"\n[main_keras.py::data_generator] MOSAIC STATUS: {'ENABLED' if train_dataset.mosaic else 'DISABLED'} (Epoch {epoch+1}/{args.epochs})")
+        
         for i in range(len(train_dataset)):
             sample, target, shapes = train_dataset[i]
             
@@ -91,15 +179,26 @@ def train(args, params):
                     if shapes.shape[0] >= 2 and shapes.shape[1] >= 2:
                         print(f"[main_keras.py::data_generator] Original size: [{shapes[0, 0]}, {shapes[0, 1]}]")
                         print(f"[main_keras.py::data_generator] Ratio/Padding: [{shapes[1, 0]}, {shapes[1, 1]}]")
+                        # Check if shapes[0] is all zeros (which would indicate mosaic was used)
+                        is_mosaic = np.all(shapes[0] == 0)
+                        print(f"[main_keras.py::data_generator] Is mosaic sample: {is_mosaic}")
                     else:
                         print(f"[main_keras.py::data_generator] Shapes content: {shapes}")
                 else:
                     print(f"[main_keras.py::data_generator] Shapes content: {shapes}")
             
             # DEBUG: Print target info for first few samples
-            if i < 5 and target.shape[0] > 0:
+            if i < 5:
                 print(f"[main_keras.py::data_generator] Target shape: {target.shape}")
-                print(f"[main_keras.py::data_generator] Target sample: {target[:3] if len(target) > 0 else 'None'}")
+                print(f"[main_keras.py::data_generator] Number of objects: {target.shape[0]}")
+                if target.shape[0] > 0:
+                    print(f"[main_keras.py::data_generator] Target sample: {target[:3] if len(target) > 0 else 'None'}")
+                    # Check if there are multiple objects with the same class ID (which would suggest they came from different images)
+                    if target.shape[0] > 1:
+                        class_ids = target[:, 1].numpy() if hasattr(target, 'numpy') else target[:, 1]
+                        unique_classes = np.unique(class_ids)
+                        print(f"[main_keras.py::data_generator] Unique class IDs: {unique_classes}")
+                        print(f"[main_keras.py::data_generator] Class counts: {[(c, np.sum(class_ids == c)) for c in unique_classes]}")
             
             # Insert the batch index in the first column like the PyTorch collate
             # function. This allows loss computation to know which image each
@@ -182,6 +281,7 @@ def train(args, params):
         # Turn off mosaic for last 10 epochs
         if args.epochs - epoch == 10:
             train_dataset.mosaic = False
+            print(f"\n[main_keras.py::train] TURNING OFF MOSAIC at epoch {epoch+1}/{args.epochs}")
 
         p_bar = tqdm(enumerate(train_loader), total=num_batch, desc=f'Epoch {epoch+1}/{args.epochs}')
         
@@ -214,19 +314,33 @@ def train(args, params):
                     else:
                         print(f"[main_keras.py::train] Batch item {batch_idx} unexpected shapes format: {shapes[batch_idx]}")
             
-            # Warmup
+            # Warmup - MATCH PYTORCH BEHAVIOR
             if x <= num_warmup:
                 xp = [0, num_warmup]
                 fp = [1, 64 / args.batch_size]
                 accumulate = max(1, np.interp(x, xp, fp).round())
                 
-                # Adjust learning rate
-                lr = np.interp(x, xp, [params['warmup_bias_lr'], params['lr0'] * learning_rate(args, params)(epoch)])
-                optimizer.learning_rate = lr
+                # Set different learning rates for each parameter group (MATCH PYTORCH)
+                # Group 0 (bias): warmup_bias_lr -> lr0 * lr_func(epoch)
+                lr_bias = np.interp(x, xp, [params['warmup_bias_lr'], params['lr0'] * lr_func(epoch)])
+                # Group 1 (weights): 0.0 -> lr0 * lr_func(epoch)
+                lr_weight = np.interp(x, xp, [0.0, params['lr0'] * lr_func(epoch)])
+                # Group 2 (batch norm): 0.0 -> lr0 * lr_func(epoch)
+                lr_bn = np.interp(x, xp, [0.0, params['lr0'] * lr_func(epoch)])
+                
+                optimizer.set_learning_rates(lr_bias, lr_weight, lr_bn)
+                
+                # Debug learning rates for first few steps
+                if epoch == 0 and i < 3:
+                    print(f"[main_keras.py::train] Warmup step {x}: bias_lr={lr_bias:.6f}, weight_lr={lr_weight:.6f}, bn_lr={lr_bn:.6f}")
                 
                 # Adjust momentum
-                if hasattr(optimizer, 'momentum'):
-                    optimizer.momentum = np.interp(x, xp, [params['warmup_momentum'], params['momentum']])
+                momentum = np.interp(x, xp, [params['warmup_momentum'], params['momentum']])
+                # Note: momentum adjustment would need to be implemented in MultiGroupOptimizer
+            else:
+                # Post-warmup: all groups use the same learning rate
+                lr = params['lr0'] * lr_func(epoch)
+                optimizer.set_learning_rates(lr, lr, lr)
 
             # Forward pass
             with tf.GradientTape() as tape:
@@ -253,6 +367,13 @@ def train(args, params):
                     print(f"\n--- [main_keras.py::train] KERAS LOSS DEBUG ---")
                     print(f"[main_keras.py::train] Loss value: {loss.numpy().item():.6f}")
                     print(f"[main_keras.py::train] Loss dtype: {loss.dtype}")
+                
+                # Scale loss for multi-GPU (MATCH PYTORCH BEHAVIOR)
+                loss *= args.batch_size
+                # Note: world_size not available in Keras args, using batch_size only for single-GPU
+                
+                if epoch == 0 and i < 3:
+                    print(f"[main_keras.py::train] After scaling - Loss value: {loss.numpy().item():.6f}")
                 
                 m_loss.update(loss.numpy(), samples.shape[0])
 

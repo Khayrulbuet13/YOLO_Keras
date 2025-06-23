@@ -4,6 +4,7 @@ import copy
 import csv
 import os
 import warnings
+import random
 
 import cv2
 import matplotlib.pyplot as plt
@@ -24,6 +25,17 @@ from contextlib import redirect_stdout
 
 warnings.filterwarnings("ignore")
 os.environ['CUDA_VISIBLE_DEVICES'] = '1'
+
+# Set consistent random seeds for reproducible results
+RANDOM_SEED = 42
+random.seed(RANDOM_SEED)
+np.random.seed(RANDOM_SEED)
+torch.manual_seed(RANDOM_SEED)
+torch.cuda.manual_seed(RANDOM_SEED)
+torch.cuda.manual_seed_all(RANDOM_SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+print(f"[main.py] Set random seed to {RANDOM_SEED} for reproducible results")
 
 
 def learning_rate(args, params):
@@ -151,6 +163,35 @@ def train(args, params):
     # -----------------------------------------------
     # 5) Training Loop
     # -----------------------------------------------
+    # Debug: Examine individual dataset samples before batching
+    print(f"\n=== [main.py::train] PYTORCH DATASET SAMPLE DEBUG ===")
+    train_dataset = loader.dataset
+    for i in range(len(train_dataset)):
+        sample, target, shapes = train_dataset[i]
+        
+        # DEBUG: Print dataset output for first few samples
+        if i < 2:
+            print(f"\n--- [main.py::train] DATASET OUTPUT DEBUG (sample {i}) ---")
+            print(f"[main.py::train] Sample shape: {sample.shape}")
+            print(f"[main.py::train] Target shape: {target.shape}")
+            print(f"[main.py::train] Shapes from dataset: {shapes}")
+            print(f"[main.py::train] Shapes type: {type(shapes)}")
+            print(f"[main.py::train] Shapes dtype: {shapes.dtype if hasattr(shapes, 'dtype') else 'N/A'}")
+            if hasattr(shapes, 'shape'):
+                print(f"[main.py::train] Shapes shape: {shapes.shape}")
+                if shapes.shape[0] >= 2 and shapes.shape[1] >= 2:
+                    print(f"[main.py::train] Original size: [{shapes[0, 0]}, {shapes[0, 1]}]")
+                    print(f"[main.py::train] Ratio/Padding: [{shapes[1, 0]}, {shapes[1, 1]}]")
+                else:
+                    print(f"[main.py::train] Shapes content: {shapes}")
+            else:
+                print(f"[main.py::train] Shapes content: {shapes}")
+        
+        # DEBUG: Print target info for first few samples
+        if i < 5 and target.shape[0] > 0:
+            print(f"[main.py::train] Target shape: {target.shape}")
+            print(f"[main.py::train] Target sample: {target[:3] if len(target) > 0 else 'None'}")
+    
     best = 0
     num_batch = len(loader)
     amp_scale = torch.cuda.amp.GradScaler()
@@ -678,7 +719,7 @@ def main():
     if args.local_rank == 0:
         os.makedirs(args.save_path, exist_ok=True)
 
-    util.setup_seed()
+    util.set_seed()
     util.setup_multi_processes()
 
     with open(args.yaml_file, 'r') as f:
