@@ -13,6 +13,7 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 
 from nets.tinysimov35_keras import yolo_v8_s
+from nets.tinysimov35_keras_quantized import yolo_v8_s_quantized
 from utils.dataset_keras import Dataset
 from utils.util_keras import (
     generate_colors, 
@@ -112,7 +113,13 @@ class MultiGroupOptimizer:
 def train(args, params):
     # Initialize with central dtype
     num_classes = len(params['names'].values())
-    model = yolo_v8_s(num_classes, img_size=args.img_size, dtype=DTYPE)  # Pass dtype to model
+    
+    # Use quantized model if specified
+    if args.quantized:
+        print("[INFO] Using quantized model (QKeras) for HLS4ml FPGA synthesis")
+        model = yolo_v8_s_quantized(num_classes, img_size=args.img_size, dtype=DTYPE)
+    else:
+        model = yolo_v8_s(num_classes, img_size=args.img_size, dtype=DTYPE)  # Pass dtype to model
     
     # Create model directory
     if args.local_rank == 0:
@@ -302,7 +309,10 @@ def train(args, params):
             eval_model = model
             if ema:
                 # Create a temporary model with EMA weights
-                eval_model = yolo_v8_s(num_classes, img_size=args.img_size)
+                if args.quantized:
+                    eval_model = yolo_v8_s_quantized(num_classes, img_size=args.img_size)
+                else:
+                    eval_model = yolo_v8_s(num_classes, img_size=args.img_size)
                 # Directly apply EMA weights
                 eval_model.set_weights([w.numpy() for w in ema.ema_weights])
             
@@ -389,7 +399,10 @@ def test(args, params, model=None, is_train=False):
     # Load model if not provided
     if model is None:
         model_path = os.path.join(args.save_path, 'best.weights.h5')
-        model = yolo_v8_s(len(params['names']), img_size=args.img_size)
+        if args.quantized:
+            model = yolo_v8_s_quantized(len(params['names']), img_size=args.img_size)
+        else:
+            model = yolo_v8_s(len(params['names']), img_size=args.img_size)
         model.load_weights(model_path)
 
 
@@ -609,6 +622,7 @@ def main():
     parser.add_argument('--epochs', default=500, type=int)
     parser.add_argument('--train', action='store_true')
     parser.add_argument('--test', action='store_true')
+    parser.add_argument('--quantized', action='store_true', help='Use QKeras quantized model for HLS4ml FPGA synthesis')
     parser.add_argument('--yaml_file', type=str, default='utils/args_bionano.yaml')
     parser.add_argument('--save-path', type=str, default='./results/rect_256x128_cleaned')
     parser.add_argument('--dataset-dir', type=str, default='./Dataset/bionano_cellv2')

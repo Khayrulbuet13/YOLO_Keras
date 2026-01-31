@@ -7,3 +7,7 @@ seaborn
 comet-ml
 PyYAML
 tqdm
+qkeras
+hls4ml
+tf-keras
+tensorflow-model-optimization
