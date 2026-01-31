@@ -35,8 +35,6 @@ def generate_colors(num_classes):
     return colors
 
 
-
-
 def visualize_predictions(samples, outputs, gt_boxes, shapes, params, class_colors, results_dir, index):
     """
     Visualize first 5 images from the val set: draws ground-truth boxes on the
@@ -159,8 +157,6 @@ def visualize_predictions(samples, outputs, gt_boxes, shapes, params, class_colo
     plt.close()
 
 
-
-
 def set_seed(seed=42):
     random.seed(seed)
     np.random.seed(seed)
@@ -243,8 +239,6 @@ def wh2xy(x):
     return y
 
 
-
-
 def non_max_suppression(prediction, conf_threshold=0.25, iou_threshold=0.45):
     """
     Performs Non-Maximum Suppression (NMS) on inference results
@@ -260,20 +254,12 @@ def non_max_suppression(prediction, conf_threshold=0.25, iou_threshold=0.45):
     """
     # Add dtype consistency
     prediction = tf.cast(prediction, DTYPE)
-    print(f"\n--- [utils/util_keras.py::non_max_suppression] KERAS NMS DEBUG ---")
-    print(f"[utils/util_keras.py::non_max_suppression] Prediction shape: {prediction.shape}")
-    print(f"[utils/util_keras.py::non_max_suppression] Conf threshold: {conf_threshold}, IoU threshold: {iou_threshold}")
     
     # Settings
     max_wh = 7680  # (pixels) maximum box width and height
     max_det = 300  # maximum number of detections per image
     max_nms = 30000  # maximum number of boxes into TF NMS
-    
-    # nc = prediction.shape[1] - 4  # number of classes
-    # prediction shape is (batch, num_boxes, num_classes + 4)
-    # Use the last dimension to determine number of classes
     nc = prediction.shape[-1] - 4  # number of classes
-    print(f"[utils/util_keras.py::non_max_suppression] Number of classes: {nc}")
     
     
     start = time.time()
@@ -366,7 +352,6 @@ def smooth(y, f=0.05):
     return np.convolve(yp, np.ones(nf) / nf, mode='valid')  # smoothed
 
 
-
 def compute_ap(tp, conf, pred_cls, target_cls, eps=1e-16):
     """
     Compute the average precision, given the recall and precision curves.
@@ -419,7 +404,9 @@ def compute_ap(tp, conf, pred_cls, target_cls, eps=1e-16):
             m_pre = np.concatenate(([1.0], precision[:, j], [0.0]))
             m_pre = np.flip(np.maximum.accumulate(np.flip(m_pre)))
             x = np.linspace(0, 1, 101)  # 101-point interp (COCO)
-            ap[ci, j] = np.trapz(np.interp(x, m_rec, m_pre), x)
+            y = np.interp(x, m_rec, m_pre)
+            # Trapezoidal integration: sum of (y[i] + y[i+1])/2 * (x[i+1] - x[i])
+            ap[ci, j] = np.sum((y[1:] + y[:-1]) / 2 * np.diff(x))
 
     # Compute F1 (harmonic mean of precision and recall)
     f1 = 2 * p * r / (p + r + eps)
@@ -487,7 +474,6 @@ import tensorflow as tf
 import math
 
 
-
 # import tensorflow as tf
 # import numpy as np
 # import math
@@ -504,9 +490,22 @@ class ComputeLoss(Layer):
         m = model.layers[-1] if hasattr(model, 'layers') else model.head
         
         self.stride = m.stride
-        if not isinstance(self.stride, (list, tuple)):
-            self.stride = [self.stride]
-        self.stride = [float(s) for s in self.stride]
+        # Convert TensorFlow tensor to numpy array if needed
+        if hasattr(self.stride, 'numpy'):
+            # It's a TensorFlow tensor, convert to numpy first
+            stride_np = self.stride.numpy()
+            if stride_np.ndim == 0:
+                # Scalar tensor
+                self.stride = [float(stride_np)]
+            else:
+                # Array tensor
+                self.stride = [float(s) for s in stride_np]
+        elif not isinstance(self.stride, (list, tuple)):
+            # Single value (not tensor, not list)
+            self.stride = [float(self.stride)]
+        else:
+            # Already a list/tuple
+            self.stride = [float(s) for s in self.stride]
         
         
         self.nc = m.nc  # number of classes
@@ -538,22 +537,12 @@ class ComputeLoss(Layer):
         # convert every map to NCHW and collect
         x = [tf.transpose(o, [0, 3, 1, 2]) for o in outputs]
         
-        # Debugging outputs
-        print(f"\n--- [utils/util.py::ComputeLoss.__call__] KERAS LOSS COMPUTATION DEBUG ---")
-        print(f"[utils/util.py::ComputeLoss.__call__] Number of output tensors: {len(outputs)}")
-        for i, o in enumerate(outputs):
-            print(f"[utils/util.py::ComputeLoss.__call__] Output {i} shape: {o.shape}")
         output = tf.concat([tf.reshape(i, (i.shape[0], self.no, -1)) for i in x], axis=2)
-        print(f"[utils/util.py::ComputeLoss.__call__] Concatenated output shape: {output.shape}")
         
         pred_output, pred_scores = tf.split(output, [4 * self.dfl_ch, self.nc], axis=1)
-        print(f"[utils/util.py::ComputeLoss.__call__] pred_output shape: {pred_output.shape}")
-        print(f"[utils/util.py::ComputeLoss.__call__] pred_scores shape: {pred_scores.shape}")
         
         pred_output = tf.transpose(pred_output, [0, 2, 1])
         pred_scores = tf.transpose(pred_scores, [0, 2, 1])
-        print(f"[utils/util.py::ComputeLoss.__call__] After permute - pred_output shape: {pred_output.shape}")
-        print(f"[utils/util.py::ComputeLoss.__call__] After permute - pred_scores shape: {pred_scores.shape}")
         
         
         # The feature maps have been converted to NCHW format above so the
@@ -562,23 +551,17 @@ class ComputeLoss(Layer):
         hw = tf.cast(tf.shape(x[0])[2:4], dtype=pred_scores.dtype)  # (h, w)
         # size = tf.reverse(hw, axis=[0]) * self.stride[0]  # (w, h) * stride
         size = hw * self.stride[0]  # (h, w) * stride
-        print(f"[utils/util.py::ComputeLoss.__call__] Size tensor: {size}")
         
         anchor_points, stride_tensor = make_anchors_tf(x, self.stride, 0.5)
         # Use cast_like for critical operations
         anchor_points = cast_like(anchor_points, outputs)
         stride_tensor = cast_like(stride_tensor, outputs)
-        print(f"[utils/util.py::ComputeLoss.__call__] Anchor points shape: {anchor_points.shape}")
-        print(f"[utils/util.py::ComputeLoss.__call__] Stride tensor shape: {stride_tensor.shape}")
 
         
         # Process targets
-        print(f"\n--- [utils/util.py::ComputeLoss.__call__] TARGET PROCESSING ---")
-        print(f"[utils/util.py::ComputeLoss.__call__] Targets shape: {targets.shape}")
         
         if tf.shape(targets)[0] == 0:
             gt = tf.zeros((pred_scores.shape[0], 0, 5), dtype=pred_scores.dtype)
-            print(f"[utils/util.py::ComputeLoss.__call__] No targets - gt shape: {gt.shape}")
         else:
             i = targets[:, 0]  # image index
             _, _, counts = tf.unique_with_counts(i)
@@ -604,26 +587,19 @@ class ComputeLoss(Layer):
         
         # Box decoding
         b, a, c = pred_output.shape
-        print(f"[utils/util.py::ComputeLoss.__call__] Pred output dimensions - b: {b}, a: {a}, c: {c}")
         pred_bboxes = tf.reshape(pred_output, (b, a, 4, c // 4))
         pred_bboxes = tf.nn.softmax(pred_bboxes, axis=3)
-        print(f"[utils/util.py::ComputeLoss.__call__] Pred bboxes after softmax shape: {pred_bboxes.shape}")
         pred_bboxes = tf.tensordot(pred_bboxes, self.project, axes=[[3], [0]])
-        print(f"[utils/util.py::ComputeLoss.__call__] Pred bboxes after matmul shape: {pred_bboxes.shape}")
         
         a_tensor, b_tensor = tf.split(pred_bboxes, 2, axis=-1)
         pred_bboxes = tf.concat([anchor_points - a_tensor, anchor_points + b_tensor], axis=-1)
-        print(f"[utils/util.py::ComputeLoss.__call__] Final pred bboxes shape: {pred_bboxes.shape}")
         
         # Detach for assignment (stop gradient)
         scores = tf.stop_gradient(tf.sigmoid(pred_scores))
         bboxes = tf.stop_gradient(pred_bboxes * stride_tensor)
         
-        print(f"[utils/util.py::ComputeLoss.__call__] Scores shape: {scores.shape}")
-        print(f"[utils/util.py::ComputeLoss.__call__] Bboxes shape: {bboxes.shape}")
         
         # Task-aligned assignment
-        print(f"\n--- [utils/util.py::ComputeLoss.__call__] ASSIGNMENT PHASE ---")
         target_bboxes, target_scores, fg_mask = self.assign(
             scores, bboxes, gt_labels, gt_bboxes, mask_gt, anchor_points * stride_tensor
         )
@@ -684,32 +660,12 @@ class ComputeLoss(Layer):
         
         # Debugging outputs
         # In ComputeLoss.call() method:
-        print(f"\n--- [utils/util.py::ComputeLoss.__call__] LOSS COMPONENTS DEBUG ---")
-        print(f"[utils/util.py::ComputeLoss.__call__] Raw loss_cls: {loss_cls.numpy().item():.6f}")
-        print(f"[utils/util.py::ComputeLoss.__call__] Raw loss_box: {loss_box.numpy().item():.6f}")
-        print(f"[utils/util.py::ComputeLoss.__call__] Raw loss_dfl: {loss_dfl.numpy().item():.6f}")
 
 
-        print(f"[utils/util.py::ComputeLoss.__call__] Loss weights - cls: {self.params['cls']}, box: {self.params['box']}, dfl: {self.params['dfl']}")
-        print(f"[utils/util.py::ComputeLoss.__call__] target_scores_sum: {target_scores_sum.numpy().item():.6f}")
-        print(f"[utils/util.py::ComputeLoss.__call__] fg_mask sum: {fg_count.numpy()}")
-        print(f"[utils/util.py::ComputeLoss.__call__] Weighted loss_cls: {loss_cls.numpy().item():.6f}")
-        print(f"[utils/util.py::ComputeLoss.__call__] Weighted loss_box: {loss_box.numpy().item():.6f}")
-        print(f"[utils/util.py::ComputeLoss.__call__] Weighted loss_dfl: {loss_dfl.numpy().item():.6f}")
-        print(f"[utils/util.py::ComputeLoss.__call__] Total loss: {total_loss.numpy().item():.6f}")
-        print(f"--- [utils/util.py::ComputeLoss.__call__] END KERAS LOSS COMPUTATION DEBUG ---\n")
         
         return total_loss
 
 
-    # def one_hot(indices, depth, dtype=tf.float32):
-    #     # identical semantic to the helper used in PyTorch code
-    #     return tf.one_hot(indices, depth, dtype=dtype)
-
-
-    # --------------------------------------------------------------------------- #
-    #  Replace your existing `assign` method with this one
-    # --------------------------------------------------------------------------- #
     def assign(
         self,
         pred_scores,   # (B, A, C)
@@ -726,31 +682,19 @@ class ComputeLoss(Layer):
         """
 
         # --------------------------- DEBUG HEADER --------------------------- #
-        print("\n--- [utils/util.py::ComputeLoss.assign] KERAS ASSIGNMENT DEBUG ---")
-        print(f"[utils/util.py::ComputeLoss.assign] pred_scores shape: {pred_scores.shape}")
-        print(f"[utils/util.py::ComputeLoss.assign] pred_bboxes shape: {pred_bboxes.shape}")
-        print(f"[utils/util.py::ComputeLoss.assign] true_labels shape: {true_labels.shape}")
-        print(f"[utils/util.py::ComputeLoss.assign] true_bboxes shape: {true_bboxes.shape}")
-        print(f"[utils.util.py::ComputeLoss.assign] true_mask shape: {true_mask.shape}")
-        print(f"[utils/util.py::ComputeLoss.assign] anchors shape: {anchors.shape}")
 
-        # ------------------------------------------------------------------- #
         # basic sizes
         self.bs           = tf.shape(pred_scores)[0]
         self.num_max_boxes = tf.shape(true_bboxes)[1]
-        print(f"[utils/util.py::ComputeLoss.assign] Batch size: {self.bs}, Max boxes: {self.num_max_boxes}")
 
-        # ------------------------------------------------------------------- #
         # no GT case --------------------------------------------------------- #
         if tf.equal(self.num_max_boxes, 0):
-            print(f"[utils/util.py::ComputeLoss.assign] No ground truth boxes, returning zeros")
             return (
                 tf.zeros_like(pred_bboxes),
                 tf.zeros_like(pred_scores),
                 tf.cast(tf.zeros_like(pred_scores[..., 0]), tf.bool)
             )
 
-        # ------------------------------------------------------------------- #
         # indices tensor i[0], i[1] ----------------------------------------- #
         i0 = tf.tile(
             tf.reshape(tf.range(self.bs, dtype=tf.int64), (-1, 1)),
@@ -758,29 +702,15 @@ class ComputeLoss(Layer):
         )                          # (B, N)
         i1 = tf.cast(tf.squeeze(true_labels, -1), tf.int64)  # (B, N)
         i = tf.stack([i0, i1], axis=0)                       # (2, B, N)
-        print(f"[utils/util.py::ComputeLoss.assign] Created indices tensor with shape: {i.shape}")
 
-        # ------------------------------------------------------------------- #
         # IoU (CIoU) between all GT and anchors ----------------------------- #
-        print("\n--- [utils/util.py::ComputeLoss.assign] IOUs DEBUG ---")
-        print(f"[utils/util.py::ComputeLoss.assign] true_bboxes shape: {true_bboxes.shape}")
-        print(f"[utils/util.py::ComputeLoss.assign] pred_bboxes shape: {pred_bboxes.shape}")
 
         overlaps = self.compute_iou(
             tf.expand_dims(true_bboxes, 2),     # (B, N, 1, 4)
             tf.expand_dims(pred_bboxes, 1)      # (B, 1, A, 4)
         )
         overlaps = tf.clip_by_value(tf.squeeze(overlaps, 3), 0.0, 1.0)  # (B, N, A)
-        print(f"[utils/util.py::ComputeLoss.assign] overlaps shape: {overlaps.shape}")
-        if tf.executing_eagerly():
-            print(f"[utils/util.py::ComputeLoss.assign] overlaps min: {tf.reduce_min(overlaps).numpy()}, "
-                f"max: {tf.reduce_max(overlaps).numpy()}")
-            # DEBUG: Print first few overlap values for comparison
-            overlaps_np = overlaps.numpy()
-            print(f"[utils/util_keras.py::ComputeLoss.assign] First 5 overlap values: {overlaps_np.flatten()[:5]}")
-            print(f"[utils/util_keras.py::ComputeLoss.assign] Overlap statistics - mean: {np.mean(overlaps_np):.6f}, std: {np.std(overlaps_np):.6f}")
 
-        # ------------------------------------------------------------------- #
         # alignment metric --------------------------------------------------- #
         # pred_scores[i[0], :, i[1]]  ->  (B, N, A)
         # FIXED: Use simpler indexing approach that matches PyTorch
@@ -796,26 +726,8 @@ class ComputeLoss(Layer):
         )                    # (B, A, N)
         scores_cls = tf.transpose(scores_cls, [0, 2, 1])  # (B, N, A)
         
-        # DEBUG: Compare with old method
-        print(f"[utils/util_keras.py::ComputeLoss.assign] NEW scores_cls shape: {scores_cls.shape}")
-        if tf.executing_eagerly():
-            print(f"[utils/util_keras.py::ComputeLoss.assign] NEW scores_cls min: {tf.reduce_min(scores_cls).numpy()}, max: {tf.reduce_max(scores_cls).numpy()}")
-
         align_metric = tf.pow(scores_cls, self.alpha) * tf.pow(overlaps, self.beta)
-        print(f"[utils/util.py::ComputeLoss.assign] align_metric shape: {align_metric.shape}")
-        if tf.executing_eagerly():
-            print(f"[utils/util_keras.py::ComputeLoss.assign] align_metric min: {tf.reduce_min(align_metric).numpy()}, max: {tf.reduce_max(align_metric).numpy()}")
-            # DEBUG: Print alignment metric statistics for comparison
-            align_metric_np = align_metric.numpy()
-            print(f"[utils/util_keras.py::ComputeLoss.assign] Alignment metric statistics - mean: {np.mean(align_metric_np):.6f}, std: {np.std(align_metric_np):.6f}")
-            print(f"[utils/util_keras.py::ComputeLoss.assign] First 5 alignment metric values: {align_metric_np.flatten()[:5]}")
-            # DEBUG: Check for NaN or inf values
-            if np.any(np.isnan(align_metric_np)):
-                print(f"[utils/util_keras.py::ComputeLoss.assign] WARNING: Found NaN values in align_metric!")
-            if np.any(np.isinf(align_metric_np)):
-                print(f"[utils/util_keras.py::ComputeLoss.assign] WARNING: Found inf values in align_metric!")
 
-        # ------------------------------------------------------------------- #
         # mask_in_gts -------------------------------------------------------- #
         bs          = tf.shape(true_bboxes)[0]
         n_boxes     = tf.shape(true_bboxes)[1]
@@ -825,73 +737,32 @@ class ComputeLoss(Layer):
         bbox_deltas = tf.concat([anchors_exp - lt, rb - anchors_exp], axis=2)  # (B*N, A, 4)
         bbox_deltas = tf.reshape(bbox_deltas, [bs, n_boxes, -1, 4])
         mask_in_gts = tf.reduce_min(bbox_deltas, axis=-1) > 1e-9            # (B, N, A)
-        print(f"[utils/util.py::ComputeLoss.assign] mask_in_gts shape: {mask_in_gts.shape}")
-        if tf.executing_eagerly():
-            print(f"[utils/util.py::ComputeLoss.assign] mask_in_gts sum: {tf.reduce_sum(tf.cast(mask_in_gts, tf.int32)).numpy()}")
-            # DEBUG: Print mask_in_gts statistics for comparison
-            mask_in_gts_np = mask_in_gts.numpy()
-            mask_in_gts_bool = mask_in_gts_np.astype(bool)
-            print(f"[utils/util_keras.py::ComputeLoss.assign] mask_in_gts statistics - True count: {np.sum(mask_in_gts_bool)}, False count: {np.sum(~mask_in_gts_bool)}")
-            print(f"[utils/util_keras.py::ComputeLoss.assign] mask_in_gts ratio: {np.mean(mask_in_gts_np):.6f}")
 
-        # ------------------------------------------------------------------- #
-        # metrics & Top-k ---------------------------------------------------- #
+        # metrics & Top-k
+
         metrics   = align_metric * tf.cast(mask_in_gts, align_metric.dtype)
-        print(f"[utils/util.py::ComputeLoss.assign] metrics shape: {metrics.shape}")
-        if tf.executing_eagerly():
-            # DEBUG: Print metrics statistics for comparison
-            metrics_np = metrics.numpy()
-            print(f"[utils/util_keras.py::ComputeLoss.assign] metrics statistics - mean: {np.mean(metrics_np):.6f}, std: {np.std(metrics_np):.6f}")
-            print(f"[utils/util_keras.py::ComputeLoss.assign] metrics non-zero count: {np.count_nonzero(metrics_np)}")
-            print(f"[utils/util_keras.py::ComputeLoss.assign] First 5 metrics values: {metrics_np.flatten()[:5]}")
 
         top_k_mask = tf.tile(tf.cast(true_mask, tf.bool), [1, 1, self.top_k])  # (B, N, K)
-        print(f"[utils/util.py::ComputeLoss.assign] top_k_mask shape: {top_k_mask.shape}")
 
         num_anchors          = tf.shape(metrics)[-1]
         top_k_metrics, top_k_indices = tf.math.top_k(metrics, k=self.top_k, sorted=True)
-        print(f"[utils/util.py::ComputeLoss.assign] top_k_metrics shape: {top_k_metrics.shape}")
-        print(f"[utils/util.py::ComputeLoss.assign] top_k_indices shape: {top_k_indices.shape}")
-        if tf.executing_eagerly():
-            # DEBUG: Print top-k statistics for comparison
-            top_k_metrics_np = top_k_metrics.numpy()
-            top_k_indices_np = top_k_indices.numpy()
-            print(f"[utils/util_keras.py::ComputeLoss.assign] top_k_metrics statistics - mean: {np.mean(top_k_metrics_np):.6f}, max: {np.max(top_k_metrics_np):.6f}")
-            print(f"[utils/util_keras.py::ComputeLoss.assign] top_k_indices range: [{np.min(top_k_indices_np)}, {np.max(top_k_indices_np)}]")
-            print(f"[utils/util_keras.py::ComputeLoss.assign] First 5 top_k_metrics values: {top_k_metrics_np.flatten()[:5]}")
 
         # if top_k_mask were None in PyTorch, we would build it here – we already have it
         top_k_indices = tf.where(top_k_mask, top_k_indices, tf.zeros_like(top_k_indices))
 
         is_in_top_k = tf.reduce_sum(one_hot(top_k_indices, num_anchors, dtype=tf.int32), axis=-2)  # (B, N, A)
-        print(f"[utils/util.py::ComputeLoss.assign] is_in_top_k shape: {is_in_top_k.shape}")
 
         # filter invalid boxes
         is_in_top_k = tf.where(is_in_top_k > 1, 0, is_in_top_k)
         mask_top_k  = tf.cast(is_in_top_k, metrics.dtype)                                         # (B, N, A)
-        print(f"[utils/util.py::ComputeLoss.assign] mask_top_k shape: {mask_top_k.shape}")
 
-        # ------------------------------------------------------------------- #
         # positive mask ------------------------------------------------------ #
         mask_pos = mask_top_k * tf.cast(mask_in_gts, mask_top_k.dtype) * tf.cast(true_mask, mask_top_k.dtype)
-        print(f"[utils/util.py::ComputeLoss.assign] mask_pos shape: {mask_pos.shape}")
 
         fg_mask = tf.reduce_sum(mask_pos, axis=1)                   # (B, A)
-        print(f"[utils/util.py::ComputeLoss.assign] fg_mask shape: {fg_mask.shape}")
-        if tf.executing_eagerly():
-            print(f"[utils/util.py::ComputeLoss.assign] fg_mask sum: {tf.reduce_sum(fg_mask).numpy()}")
-            # DEBUG: Print positive mask statistics for comparison
-            mask_pos_np = mask_pos.numpy()
-            fg_mask_np = fg_mask.numpy()
-            mask_pos_bool = mask_pos_np.astype(bool)
-            print(f"[utils/util_keras.py::ComputeLoss.assign] mask_pos statistics - True count: {np.sum(mask_pos_bool)}, False count: {np.sum(~mask_pos_bool)}")
-            print(f"[utils/util_keras.py::ComputeLoss.assign] mask_pos ratio: {np.mean(mask_pos_np):.6f}")
-            print(f"[utils/util_keras.py::ComputeLoss.assign] fg_mask statistics - mean: {np.mean(fg_mask_np):.6f}, max: {np.max(fg_mask_np):.6f}")
-            print(f"[utils/util_keras.py::ComputeLoss.assign] fg_mask non-zero anchors: {np.count_nonzero(fg_mask_np)}")
 
-        # resolve anchors that hit multiple GTs ----------------------------- #
+        # resolve anchors that hit multiple GTs
         if tf.reduce_max(fg_mask) > 1:
-            print(f"[utils/util.py::ComputeLoss.assign] Detected anchors assigned to multiple GT boxes")
             mask_multi_gts = tf.tile(tf.expand_dims(fg_mask > 1, 1), [1, self.num_max_boxes, 1])  # (B,N,A)
 
             max_overlaps_idx = tf.argmax(overlaps, axis=1)                    # (B, A)
@@ -900,16 +771,10 @@ class ComputeLoss(Layer):
 
             mask_pos = tf.where(mask_multi_gts, is_max_overlaps, mask_pos)
             fg_mask  = tf.reduce_sum(mask_pos, axis=1)
-            if tf.executing_eagerly():
-                print(f"[utils/util.py::ComputeLoss.assign] After resolving multiple assignments - fg_mask sum: "
-                    f"{tf.reduce_sum(fg_mask).numpy()}")
 
-        # ------------------------------------------------------------------- #
         # which GT each anchor serves --------------------------------------- #
         target_gt_idx = tf.argmax(mask_pos, axis=1)                           # (B, A)
-        print(f"[utils/util.py::ComputeLoss.assign] target_gt_idx shape: {target_gt_idx.shape}")
 
-        # ------------------------------------------------------------------- #
         # gather GT labels (shape: B × A) ----------------------------------- #
         flat_labels  = tf.reshape(true_labels, [-1])           # (B·N,)
         flat_bboxes  = tf.reshape(true_bboxes, [-1, 4])        # (B·N,4)
@@ -923,31 +788,16 @@ class ComputeLoss(Layer):
         # target_bboxes = tf.reshape(bboxes_flat,
         #                        tf.concat([tf.shape(target_gt_idx), [4]], 0))  # (B,A,4)
 
-        # print(f"[utils/util.py::ComputeLoss.assign] target_labels shape: {target_labels.shape}")
-        # print(f"[utils/util.py::ComputeLoss.assign] target_bboxes shape: {target_bboxes.shape}")
-        # if tf.executing_eagerly():
-        #     # DEBUG: Print target assignment statistics for comparison
         #     target_labels_np = target_labels.numpy()
         #     target_bboxes_np = target_bboxes.numpy()
-        #     print(f"[utils/util_keras.py::ComputeLoss.assign] target_labels statistics - min: {np.min(target_labels_np)}, max: {np.max(target_labels_np)}")
-        #     print(f"[utils/util_keras.py::ComputeLoss.assign] target_labels unique values: {np.unique(target_labels_np)}")
-        #     print(f"[utils/util_keras.py::ComputeLoss.assign] target_bboxes statistics - mean: {np.mean(target_bboxes_np):.6f}, std: {np.std(target_bboxes_np):.6f}")
-        #     print(f"[utils/util_keras.py::ComputeLoss.assign] target_bboxes range: [{np.min(target_bboxes_np):.6f}, {np.max(target_bboxes_np):.6f}]")
 
         # Step 1: Make sure self.nc is correct
-        print(f"[utils/util_keras.py::ComputeLoss.assign] self.nc: {self.nc}")  # Should be >1
 
         # Step 2: Correct one-hot encoding - FIX THE CRITICAL ISSUE HERE
         # The problem is that target_labels might be all zeros due to indexing issues
         # Let's use a more robust approach that matches PyTorch exactly
         
         # First, let's check what the actual ground truth labels are
-        if tf.executing_eagerly():
-            true_labels_np = true_labels.numpy()
-            print(f"[utils/util_keras.py::ComputeLoss.assign] CRITICAL DEBUG - true_labels content:")
-            print(f"[utils/util_keras.py::ComputeLoss.assign] true_labels shape: {true_labels_np.shape}")
-            print(f"[utils/util_keras.py::ComputeLoss.assign] true_labels unique values: {np.unique(true_labels_np)}")
-            print(f"[utils/util_keras.py::ComputeLoss.assign] true_labels sample: {true_labels_np[0, :5] if true_labels_np.shape[1] > 0 else 'empty'}")
         
         # Use a more direct approach to get target labels
         # Create batch indices for gathering
@@ -960,14 +810,6 @@ class ComputeLoss(Layer):
         target_labels = tf.gather_nd(true_labels, gather_indices)  # (B, A)
         target_bboxes = tf.gather_nd(true_bboxes, gather_indices)  # (B, A, 4)
         
-        if tf.executing_eagerly():
-            target_labels_np = target_labels.numpy()
-            target_bboxes_np = target_bboxes.numpy()
-            print(f"[utils/util_keras.py::ComputeLoss.assign] FIXED target_labels statistics - min: {np.min(target_labels_np)}, max: {np.max(target_labels_np)}")
-            print(f"[utils/util_keras.py::ComputeLoss.assign] FIXED target_labels unique values: {np.unique(target_labels_np)}")
-            print(f"[utils/util_keras.py::ComputeLoss.assign] FIXED target_labels sample: {target_labels_np[0, :10]}")
-            print(f"[utils/util_keras.py::ComputeLoss.assign] FIXED target_bboxes statistics - mean: {np.mean(target_bboxes_np):.6f}, std: {np.std(target_bboxes_np):.6f}")
-            print(f"[utils/util_keras.py::ComputeLoss.assign] FIXED target_bboxes range: [{np.min(target_bboxes_np):.6f}, {np.max(target_bboxes_np):.6f}]")
         
         # Clamp labels to valid range and create one-hot encoding
         target_labels_clamped = tf.clip_by_value(target_labels, 0, self.nc - 1)
@@ -975,8 +817,6 @@ class ComputeLoss(Layer):
 
         # Step 3: Mask out background anchors
         fg_scores_mask = tf.tile(tf.expand_dims(fg_mask > 0, -1), [1, 1, self.nc])
-        print(f"[DEBUG] target_scores shape before masking: {target_scores.shape}")
-        print(f"[DEBUG] fg_scores_mask shape before masking: {fg_scores_mask.shape}")
         # Fix: Squeeze singleton dimensions if present
         if len(target_scores.shape) == 4 and target_scores.shape[-1] == 1:
             target_scores = tf.squeeze(target_scores, axis=-1)
@@ -984,15 +824,6 @@ class ComputeLoss(Layer):
             fg_scores_mask = tf.squeeze(fg_scores_mask, axis=-1)
         fg_scores_mask = tf.broadcast_to(fg_scores_mask, tf.shape(target_scores))
         target_scores = tf.where(fg_scores_mask, target_scores, 0.0)
-        print(f"[utils/util.py::ComputeLoss.assign] target_scores shape: {target_scores.shape}")
-        if tf.executing_eagerly():
-            # DEBUG: Print target scores statistics before normalization
-            target_scores_np = target_scores.numpy()
-            print(f"[utils/util_keras.py::ComputeLoss.assign] target_scores before norm - sum: {np.sum(target_scores_np):.6f}")
-            print(f"[utils/util_keras.py::ComputeLoss.assign] target_scores before norm - mean: {np.mean(target_scores_np):.6f}")
-            print(f"[utils/util_keras.py::ComputeLoss.assign] target_scores before norm - non-zero count: {np.count_nonzero(target_scores_np)}")
-            print(f"[utils/util_keras.py::ComputeLoss.assign] target_scores before norm - max: {np.max(target_scores_np):.6f}")
-            print(f"[utils/util_keras.py::ComputeLoss.assign] target_scores before norm - unique values: {np.unique(target_scores_np)}")
 
         # Step 4: Normalize using align_metric (FIXED to match PyTorch exactly)
         # PyTorch: align_metric *= mask_pos
@@ -1002,137 +833,30 @@ class ComputeLoss(Layer):
         #          norm_align_metric = norm_align_metric.unsqueeze(-1)
         #          target_scores = target_scores * norm_align_metric
         
-        print(f"\n--- [utils/util_keras.py::ComputeLoss.assign] KERAS NORMALIZATION DEBUG ---")
-        print(f"[utils/util_keras.py::ComputeLoss.assign] Before normalization - align_metric shape: {align_metric.shape}")
-        print(f"[utils/util_keras.py::ComputeLoss.assign] Before normalization - mask_pos shape: {mask_pos.shape}")
-        print(f"[utils/util_keras.py::ComputeLoss.assign] Before normalization - overlaps shape: {overlaps.shape}")
         
         align_metric *= mask_pos  # (B, N, A)
-        print(f"[utils/util_keras.py::ComputeLoss.assign] After align_metric *= mask_pos - align_metric shape: {align_metric.shape}")
-        if tf.executing_eagerly():
-            print(f"[utils/util_keras.py::ComputeLoss.assign] After align_metric *= mask_pos - align_metric min: {tf.reduce_min(align_metric).numpy()}, max: {tf.reduce_max(align_metric).numpy()}")
         
         pos_align_metrics = tf.reduce_max(align_metric, axis=-1, keepdims=True)  # (B, N, 1)
-        print(f"[utils/util_keras.py::ComputeLoss.assign] pos_align_metrics shape: {pos_align_metrics.shape}")
-        if tf.executing_eagerly():
-            print(f"[utils/util_keras.py::ComputeLoss.assign] pos_align_metrics min: {tf.reduce_min(pos_align_metrics).numpy()}, max: {tf.reduce_max(pos_align_metrics).numpy()}")
         
         pos_overlaps = tf.reduce_max(overlaps * mask_pos, axis=-1, keepdims=True)  # (B, N, 1)
-        print(f"[utils/util_keras.py::ComputeLoss.assign] pos_overlaps shape: {pos_overlaps.shape}")
-        if tf.executing_eagerly():
-            print(f"[utils/util_keras.py::ComputeLoss.assign] pos_overlaps min: {tf.reduce_min(pos_overlaps).numpy()}, max: {tf.reduce_max(pos_overlaps).numpy()}")
         
         # Compute normalized alignment metric
-        print(f"[utils/util_keras.py::ComputeLoss.assign] About to compute norm_align_metric with axis=1 (reduce over N)")
         norm_align_metric = tf.reduce_max(
             align_metric * pos_overlaps / (pos_align_metrics + self.eps), 
             axis=1,  # reduce over N
             keepdims=False
         )  # (B, A)
-        print(f"[utils/util_keras.py::ComputeLoss.assign] norm_align_metric shape: {norm_align_metric.shape}")
-        if tf.executing_eagerly():
-            print(f"[utils/util_keras.py::ComputeLoss.assign] norm_align_metric min: {tf.reduce_min(norm_align_metric).numpy()}, max: {tf.reduce_max(norm_align_metric).numpy()}")
         
         norm_align_metric = tf.expand_dims(norm_align_metric, axis=-1)  # (B, A, 1)
-        print(f"[utils/util_keras.py::ComputeLoss.assign] After expand_dims - norm_align_metric shape: {norm_align_metric.shape}")
-        if tf.executing_eagerly():
-            print(f"[utils/util_keras.py::ComputeLoss.assign] After expand_dims - norm_align_metric min: {tf.reduce_min(norm_align_metric).numpy()}, max: {tf.reduce_max(norm_align_metric).numpy()}")
-        
-        print(f"[utils/util_keras.py::ComputeLoss.assign] Before multiplication - target_scores shape: {target_scores.shape}")
-        if tf.executing_eagerly():
-            print(f"[utils/util_keras.py::ComputeLoss.assign] Before multiplication - target_scores sum: {tf.reduce_sum(target_scores).numpy()}")
         
         # Apply normalization to target scores
         target_scores = target_scores * norm_align_metric  # (B, A, C)
-        print(f"[utils/util_keras.py::ComputeLoss.assign] After multiplication - target_scores shape: {target_scores.shape}")
-        if tf.executing_eagerly():
-            print(f"[utils/util_keras.py::ComputeLoss.assign] After multiplication - target_scores sum: {tf.reduce_sum(target_scores).numpy()}")
-        print(f"--- [utils/util_keras.py::ComputeLoss.assign] END KERAS NORMALIZATION DEBUG ---\n")
         
-        print(f"[utils/util.py::ComputeLoss.assign] Normalized target_scores shape: {target_scores.shape}")
-        if tf.executing_eagerly():
-            print(f"[utils/util.py::ComputeLoss.assign] target_scores sum: {tf.reduce_sum(target_scores).numpy()}")
-            # DEBUG: Print final target scores statistics for comparison
-            target_scores_final_np = target_scores.numpy()
-            norm_align_metric_np = norm_align_metric.numpy()
-            print(f"[utils/util_keras.py::ComputeLoss.assign] Final target_scores statistics - sum: {np.sum(target_scores_final_np):.6f}")
-            print(f"[utils/util_keras.py::ComputeLoss.assign] Final target_scores statistics - mean: {np.mean(target_scores_final_np):.6f}")
-            print(f"[utils/util_keras.py::ComputeLoss.assign] Final target_scores statistics - max: {np.max(target_scores_final_np):.6f}")
-            print(f"[utils/util_keras.py::ComputeLoss.assign] norm_align_metric statistics - mean: {np.mean(norm_align_metric_np):.6f}, max: {np.max(norm_align_metric_np):.6f}")
-            print(f"[utils/util_keras.py::ComputeLoss.assign] norm_align_metric non-zero count: {np.count_nonzero(norm_align_metric_np)}")
 
         return target_bboxes, target_scores, tf.cast(fg_mask > 0, tf.bool)
 
 
-
-
-    # def df_loss(self, pred_dist, target):
-        
-    #     print(f"\n--- [utils/util_keras.py::ComputeLoss.df_loss] PYTORCH DFL LOSS DEBUG ---")
-    #     print(f"[utils/util_keras.py::ComputeLoss.df_loss] pred_dist shape: {pred_dist.shape}, dtype: {pred_dist.dtype}")
-    #     print(f"[utils/util_keras.py::ComputeLoss.df_loss] target shape: {target.shape}, dtype: {target.dtype}")
-    #     tl = tf.cast(target, tf.int32)  # target left
-    #     tr = tl + 1  # target right
-    #     # Cast tr back to the same dtype as target to avoid type mismatch
-    #     tr_float = tf.cast(tr, target.dtype)
-    #     wl = tr_float - target  # weight left
-    #     wr = 1.0 - wl  # weight right
-        
-    #     # Get left and right values
-    #     left_loss = tf.keras.losses.sparse_categorical_crossentropy(
-    #         tl, pred_dist, from_logits=True, axis=-1
-    #     )
-    #     right_loss = tf.keras.losses.sparse_categorical_crossentropy(
-    #         tr, pred_dist, from_logits=True, axis=-1
-    #     )
-        
-    #     # Reshape and combine losses
-    #     left_loss = tf.reshape(left_loss, tl.shape)
-    #     right_loss = tf.reshape(right_loss, tl.shape)
-        
-    #     print(f"[utils/util_keras.py::ComputeLoss.df_loss] DFL loss shape: {loss.shape}")
-    #     print(f"[utils/util_keras.py::ComputeLoss.df_loss] DFL loss mean: {loss.mean().item():.6f}")
-    #     print(f"--- [utils/util_keras.py::ComputeLoss.df_loss] END PYTORCH DFL LOSS DEBUG ---\n")
-        
-    #     return tf.reduce_mean(left_loss * wl + right_loss * wr, axis=-1, keepdims=True)
-
-
-
-    # def df_loss(self, pred_dist, target):
-    #     print(f"\n--- [utils/util_keras.py::ComputeLoss.df_loss] KERAS DFL LOSS DEBUG ---")
-    #     print(f"[utils/util_keras.py::ComputeLoss.df_loss] pred_dist shape: {pred_dist.shape}, dtype: {pred_dist.dtype}")
-    #     print(f"[utils/util_keras.py::ComputeLoss.df_loss] target shape: {target.shape}, dtype: {target.dtype}")
-        
-    #     tl = tf.cast(target, tf.int32)  # target left
-    #     tr = tl + 1  # target right
-    #     # Cast tr back to the same dtype as target to avoid type mismatch
-    #     tr_float = tf.cast(tr, target.dtype)
-    #     wl = tr_float - target  # weight left
-    #     wr = 1.0 - wl  # weight right
-        
-    #     # Get left and right values
-    #     left_loss = tf.keras.losses.sparse_categorical_crossentropy(
-    #         tl, pred_dist, from_logits=True, axis=-1
-    #     )
-    #     right_loss = tf.keras.losses.sparse_categorical_crossentropy(
-    #         tr, pred_dist, from_logits=True, axis=-1
-    #     )
-        
-    #     # Combine losses
-    #     loss = left_loss * wl + right_loss * wr
-        
-    #     print(f"[utils/util_keras.py::ComputeLoss.df_loss] DFL loss shape: {loss.shape}")
-    #     if tf.executing_eagerly():
-    #         print(f"[utils/util_keras.py::ComputeLoss.df_loss] DFL loss mean: {tf.reduce_mean(loss).numpy().item():.6f}")
-    #     print(f"--- [utils/util_keras.py::ComputeLoss.df_loss] END KERAS DFL LOSS DEBUG ---\n")
-        
-    #     return loss
-
-
     def df_loss(self, pred_dist, target):
-        print(f"\n--- [utils/util_keras.py::ComputeLoss.df_loss] KERAS DFL LOSS DEBUG ---")
-        print(f"[utils/util_keras.py::ComputeLoss.df_loss] pred_dist shape: {pred_dist.shape}, dtype: {pred_dist.dtype}")
-        print(f"[utils/util_keras.py::ComputeLoss.df_loss] target shape: {target.shape}, dtype: {target.dtype}")
         
         tl = tf.cast(target, tf.int32)  # target left
         tr = tl + 1  # target right
@@ -1156,11 +880,6 @@ class ComputeLoss(Layer):
         loss_per_anchor = tf.reshape(loss_per_coord, (n_fg, 4))
         loss = tf.reduce_mean(loss_per_anchor, axis=1, keepdims=True)  # Shape: (n_fg, 1)
         
-        print(f"[utils/util_keras.py::ComputeLoss.df_loss] DFL loss shape: {loss.shape}")
-        if tf.executing_eagerly():
-            print(f"[utils/util_keras.py::ComputeLoss.df_loss] DFL loss mean: {tf.reduce_mean(loss).numpy().item():.6f}")
-        print(f"--- [utils/util_keras.py::ComputeLoss.df_loss] END KERAS DFL LOSS DEBUG ---\n")
-        
         return loss
 
     def compute_iou(self, box1, box2, eps=1e-7):
@@ -1178,10 +897,6 @@ class ComputeLoss(Layer):
         -------
         ciou : Tensor[..., 1]   – same broadcasted shape as intersection/union
         """
-        # ---------- DEBUG LOG HEADER ----------
-        print("\n--- [utils/util.py::ComputeLoss.iou] KERAS IOU DEBUG ---")
-        print(f"[utils/util.py::ComputeLoss.iou] box1 shape: {box1.shape}")
-        print(f"[utils/util.py::ComputeLoss.iou] box2 shape: {box2.shape}")
 
         # Coordinate split (x1, y1, x2, y2)
         b1_x1, b1_y1, b1_x2, b1_y2 = tf.split(box1, 4, axis=-1)
@@ -1190,45 +905,26 @@ class ComputeLoss(Layer):
         # Width / height (+eps exactly like PyTorch)
         w1, h1 = b1_x2 - b1_x1, b1_y2 - b1_y1 + eps
         w2, h2 = b2_x2 - b2_x1, b2_y2 - b2_y1 + eps
-        print(f"[utils/util.py::ComputeLoss.iou] Box1 dimensions - w: {w1.shape}, h: {h1.shape}")
-        print(f"[utils/util.py::ComputeLoss.iou] Box2 dimensions - w: {w2.shape}, h: {h2.shape}")
 
-        # -------- Intersection --------
         inter_w = tf.maximum(tf.minimum(b1_x2, b2_x2) - tf.maximum(b1_x1, b2_x1), 0.0)
         inter_h = tf.maximum(tf.minimum(b1_y2, b2_y2) - tf.maximum(b1_y1, b2_y1), 0.0)
         intersection = inter_w * inter_h
-        print(f"[utils/util.py::ComputeLoss.iou] Intersection shape: {intersection.shape}")
 
-        # -------- Union & IoU --------
         union = w1 * h1 + w2 * h2 - intersection + eps
-        print(f"[utils/util.py::ComputeLoss.iou] Union shape: {union.shape}")
 
         iou = intersection / union
-        print(f"[utils/util.py::ComputeLoss.iou] IoU shape: {iou.shape}")
-        if tf.size(iou) > 0 and tf.executing_eagerly():
-            print(f"[utils/util.py::ComputeLoss.iou] IoU min: {tf.reduce_min(iou).numpy():.6f}, "
-                f"max: {tf.reduce_max(iou).numpy():.6f}")
 
-        # -------- CIoU terms --------
         cw = tf.maximum(b1_x2, b2_x2) - tf.minimum(b1_x1, b2_x1)          # convex width
         ch = tf.maximum(b1_y2, b2_y2) - tf.minimum(b1_y1, b2_y1)          # convex height
         c2 = cw**2 + ch**2 + eps                                          # convex diag²
-        print(f"[utils/util.py::ComputeLoss.iou] Convex diagonal squared shape: {c2.shape}")
 
         rho2 = ((b2_x1 + b2_x2 - b1_x1 - b1_x2)**2 +
                 (b2_y1 + b2_y2 - b1_y1 - b1_y2)**2) / 4.0
-        print(f"[utils/util.py::ComputeLoss.iou] Center distance squared shape: {rho2.shape}")
 
         v = (4.0 / (math.pi**2)) * tf.square(tf.atan(w2 / (h2)) - tf.atan(w1 / (h1)))
-        print(f"[utils/util.py::ComputeLoss.iou] Aspect ratio term shape: {v.shape}")
 
         alpha = tf.stop_gradient(v / (v - iou + (1.0 + eps)))             # matches torch.no_grad()
 
         ciou = iou - (rho2 / c2 + v * alpha)
-        print(f"[utils/util.py::ComputeLoss.iou] CIoU shape: {ciou.shape}")
-        if tf.size(ciou) > 0 and tf.executing_eagerly():
-            print(f"[utils/util.py::ComputeLoss.iou] CIoU min: {tf.reduce_min(ciou).numpy():.6f}, "
-                f"max: {tf.reduce_max(ciou).numpy():.6f}")
-        print("--- [utils/util.py::ComputeLoss.iou] END KERAS IOU DEBUG ---\n")
 
         return ciou  # do NOT squeeze – shape identical to PyTorch
