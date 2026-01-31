@@ -1,7 +1,5 @@
-tensorflow
-keras
+tensorflow>=2.13.0
 numpy
-pandas
 opencv-python
 matplotlib
 scipy
@@ -9,7 +7,3 @@ seaborn
 comet-ml
 PyYAML
 tqdm
-torch<=2.5
-torchsummary
-torchvision
-ipykernel

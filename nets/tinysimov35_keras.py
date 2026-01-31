@@ -44,34 +44,6 @@ class DarkNet(Model):
             x = layer(x)
         return x
 
-# class DFL(layers.Layer):
-#     def __init__(self, ch=16):
-#         super().__init__()
-#         self.ch = ch
-#         self.conv = layers.Conv2D(
-#             filters=ch, 
-#             kernel_size=1, 
-#             padding='same', 
-#             use_bias=False,
-#             trainable=False  # Non-trainable weights
-#         )
-
-#     def build(self, input_shape):
-#         super().build(input_shape)
-#         in_channels = input_shape[-1]
-        
-#         # Create fixed weights: [0, 1, 2, ..., ch-1] repeated for each input channel
-#         kernel = tf.range(self.ch, dtype=tf.float32)
-#         kernel = tf.reshape(kernel, [1, 1, 1, self.ch])
-#         kernel = tf.repeat(kernel, repeats=in_channels, axis=2)
-        
-#         # Set weights after building conv layer
-#         self.conv.build(input_shape)
-#         self.conv.set_weights([kernel])
-
-#     def call(self, x):
-#         return self.conv(x)
-
 class DFL(layers.Layer):
     def __init__(self, ch=16, dtype=tf.float32):
         super().__init__(dtype=dtype)
@@ -131,19 +103,24 @@ class Head(Model):
                 
             box_dfl = tf.stack(box_dfl, axis=2)  # (B, HW, 4)
             
-            # Generate anchors (different from training)
+            # Generate anchors in feature map units (like PyTorch)
             h, w = tf.shape(x)[1], tf.shape(x)[2]
-            grid_x = (tf.range(w, dtype=self.dtype_) + 0.5) * self.stride
-            grid_y = (tf.range(h, dtype=self.dtype_) + 0.5) * self.stride
+            grid_x = tf.range(w, dtype=self.dtype_) + 0.5  # NOT scaled by stride
+            grid_y = tf.range(h, dtype=self.dtype_) + 0.5
             grid = tf.stack(tf.meshgrid(grid_x, grid_y), axis=-1)  # (H, W, 2)
             anchors = tf.reshape(grid, [1, -1, 2])  # (1, HW, 2)
             
-            # Calculate final boxes
+            # Calculate final boxes (matching PyTorch exactly)
             a, b_coords = tf.split(box_dfl, 2, axis=2)  # 2x (B, HW, 2)
+            # PyTorch: box_coords = cat(((anchors - a + anchors + b) / 2, (anchors + b) - (anchors - a)), 1)
+            # Simplifies to: center = anchors + (b - a) / 2, wh = a + b
             boxes = tf.concat([
                 (anchors - a + anchors + b_coords) / 2,  # (x_center, y_center)
-                (b_coords - a)                           # (width, height)
+                (a + b_coords)                           # (width, height) - FIXED: was (b_coords - a)
             ], axis=-1)
+            
+            # Apply stride scaling (like PyTorch: box_coords * self.strides)
+            boxes = boxes * self.stride
             
             return tf.concat([boxes, tf.sigmoid(cls_flat)], axis=-1)  # (B, HW, 5)
 
@@ -173,16 +150,6 @@ class YOLO(Model):
         
         # Initialize biases now that layers exist
         self.initialize_biases()
-
-        # Debug info about initialized biases and initial logits
-        print("[nets/tinysimov35_keras.YOLO.__init__] Box bias mean:",
-              float(tf.reduce_mean(self.head.box.bias)))
-        print("[nets/tinysimov35_keras.YOLO.__init__] Cls bias mean:",
-              float(tf.reduce_mean(self.head.cls.bias)))
-        logits = self.head(self.net(dummy), training=True)
-        print(
-            f"[nets/tinysimov35_keras.YOLO.__init__] Initial logits min/max: {float(tf.reduce_min(logits)):.4f}/{float(tf.reduce_max(logits)):.4f}"
-        )
         
     def call(self, x, training=False):
         features = self.net(x)
@@ -205,23 +172,12 @@ class YOLO(Model):
         # Box bias
         if hasattr(self.head.box, 'bias') and self.head.box.bias is not None:
             self.head.box.bias.assign(tf.ones_like(self.head.box.bias))
-            print("[nets/tinysimov35_keras.initialize_biases] Box bias initialized")
         # Class bias
         if hasattr(self.head.cls, 'bias') and self.head.cls.bias is not None:
             b = self.head.cls.bias
             bias_value = tf.math.log(5 / self.head.nc / (640 / s) ** 2)
             b.assign(tf.ones_like(b) * tf.cast(bias_value, b.dtype))
-            print("[nets/tinysimov35_keras.initialize_biases] Cls bias initialized")
-    
-    
-    # def initialize_biases(self):
-    #     s = self.stride[0].numpy()
-    #     if self.head.box.bias is not None:
-    #         self.head.box.bias.assign(tf.ones_like(self.head.box.bias))
-    #     if self.head.cls.bias is not None:
-    #         # Use Keras-compatible initializer
-    #         b_init = tf.math.log(5 / self.head.nc / (640 / s) ** 2)
-    #         self.head.cls.bias.assign(tf.ones_like(self.head.cls.bias) * b_init)
+
 
 def yolo_v8_s(num_classes: int = 20, img_size=(256, 256), dtype=tf.float32):
     """

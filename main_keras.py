@@ -32,7 +32,6 @@ RANDOM_SEED = 42
 random.seed(RANDOM_SEED)
 np.random.seed(RANDOM_SEED)
 tf.random.set_seed(RANDOM_SEED)
-print(f"[main_keras.py] Set random seed to {RANDOM_SEED} for reproducible results")
 
 def learning_rate(args, params):
     def fn(epoch):
@@ -65,24 +64,14 @@ class MultiGroupOptimizer:
         self.weight_params = self.weight_params - self.bn_params
 
         # Initialize momentum variables as tf.Variable
+        # Use variable name as key (variables are not hashable, but names are)
         self.momentum_vars = {}
         for var in all_vars:
-            self.momentum_vars[var.ref()] = tf.Variable(tf.zeros_like(var), trainable=False)
+            self.momentum_vars[var.name] = tf.Variable(tf.zeros_like(var), trainable=False)
 
         self.lr_bias = lr0
         self.lr_weight = lr0
         self.lr_bn = lr0
-
-        print(f"[MultiGroupOptimizer] Total trainable variables: {len(all_vars)}")
-        print(f"[MultiGroupOptimizer] Bias params: {len(self.bias_params)}")
-        print(f"[MultiGroupOptimizer] Weight params: {len(self.weight_params)}")
-        print(f"[MultiGroupOptimizer] BatchNorm params: {len(self.bn_params)}")
-        if self.bias_params:
-            print(f"[MultiGroupOptimizer] Sample bias var: {list(self.bias_params)[0]}")
-        if self.weight_params:
-            print(f"[MultiGroupOptimizer] Sample weight var: {list(self.weight_params)[0]}")
-        if self.bn_params:
-            print(f"[MultiGroupOptimizer] Sample BN var: {list(self.bn_params)[0]}")
 
     def set_learning_rates(self, lr_bias, lr_weight, lr_bn):
         self.lr_bias = lr_bias
@@ -103,8 +92,15 @@ class MultiGroupOptimizer:
             # Apply weight decay to weights (not bias or batch norm)
             if var_name in self.weight_params:
                 grad = grad + self.weight_decay * var
-            # Apply momentum using ref() as key
-            momentum_var = self.momentum_vars[var.ref()]
+            # Apply momentum using variable name as key
+            # Create momentum variable if it doesn't exist or has wrong shape
+            if var_name not in self.momentum_vars:
+                self.momentum_vars[var_name] = tf.Variable(tf.zeros_like(var), trainable=False)
+            momentum_var = self.momentum_vars[var_name]
+            # Check if shapes match, recreate if needed
+            if momentum_var.shape != grad.shape:
+                self.momentum_vars[var_name] = tf.Variable(tf.zeros_like(grad), trainable=False)
+                momentum_var = self.momentum_vars[var_name]
             momentum_var.assign(self.momentum * momentum_var + grad)
             # Apply update
             if self.nesterov:
@@ -116,9 +112,7 @@ class MultiGroupOptimizer:
 def train(args, params):
     # Initialize with central dtype
     num_classes = len(params['names'].values())
-    print(f"[main_keras.py::train] Number of classes: {num_classes}")
     model = yolo_v8_s(num_classes, img_size=args.img_size, dtype=DTYPE)  # Pass dtype to model
-    print(f"[main_keras.py::train] Model created with input size: {args.img_size}")
     
     # Create model directory
     if args.local_rank == 0:
@@ -160,45 +154,22 @@ def train(args, params):
         batch_shapes = []
         batch_size = args.batch_size
         
-        # DEBUG: Print mosaic status
-        print(f"\n[main_keras.py::data_generator] MOSAIC STATUS: {'ENABLED' if train_dataset.mosaic else 'DISABLED'} (Epoch {epoch+1}/{args.epochs})")
         
         for i in range(len(train_dataset)):
             sample, target, shapes = train_dataset[i]
             
-            # DEBUG: Print dataset output for first few samples
             if i < 2:
-                print(f"\n--- [main_keras.py::data_generator] DATASET OUTPUT DEBUG (sample {i}) ---")
-                print(f"[main_keras.py::data_generator] Sample shape: {sample.shape}")
-                print(f"[main_keras.py::data_generator] Target shape: {target.shape}")
-                print(f"[main_keras.py::data_generator] Shapes from dataset: {shapes}")
-                print(f"[main_keras.py::data_generator] Shapes type: {type(shapes)}")
-                print(f"[main_keras.py::data_generator] Shapes dtype: {shapes.dtype if hasattr(shapes, 'dtype') else 'N/A'}")
                 if hasattr(shapes, 'shape'):
-                    print(f"[main_keras.py::data_generator] Shapes shape: {shapes.shape}")
                     if shapes.shape[0] >= 2 and shapes.shape[1] >= 2:
-                        print(f"[main_keras.py::data_generator] Original size: [{shapes[0, 0]}, {shapes[0, 1]}]")
-                        print(f"[main_keras.py::data_generator] Ratio/Padding: [{shapes[1, 0]}, {shapes[1, 1]}]")
                         # Check if shapes[0] is all zeros (which would indicate mosaic was used)
                         is_mosaic = np.all(shapes[0] == 0)
-                        print(f"[main_keras.py::data_generator] Is mosaic sample: {is_mosaic}")
-                    else:
-                        print(f"[main_keras.py::data_generator] Shapes content: {shapes}")
-                else:
-                    print(f"[main_keras.py::data_generator] Shapes content: {shapes}")
             
-            # DEBUG: Print target info for first few samples
             if i < 5:
-                print(f"[main_keras.py::data_generator] Target shape: {target.shape}")
-                print(f"[main_keras.py::data_generator] Number of objects: {target.shape[0]}")
                 if target.shape[0] > 0:
-                    print(f"[main_keras.py::data_generator] Target sample: {target[:3] if len(target) > 0 else 'None'}")
                     # Check if there are multiple objects with the same class ID (which would suggest they came from different images)
                     if target.shape[0] > 1:
                         class_ids = target[:, 1].numpy() if hasattr(target, 'numpy') else target[:, 1]
                         unique_classes = np.unique(class_ids)
-                        print(f"[main_keras.py::data_generator] Unique class IDs: {unique_classes}")
-                        print(f"[main_keras.py::data_generator] Class counts: {[(c, np.sum(class_ids == c)) for c in unique_classes]}")
             
             # Insert the batch index in the first column like the PyTorch collate
             # function. This allows loss computation to know which image each
@@ -214,8 +185,8 @@ def train(args, params):
                 batch_targets.append(target)
             batch_shapes.append(shapes)
             
-            # When we have a complete batch, yield it
-            if (i + 1) % batch_size == 0 or i == len(train_dataset) - 1:
+            # When we have a complete batch, yield it (drop incomplete last batch)
+            if (i + 1) % batch_size == 0:
                 # Stack samples
                 stacked_samples = tf.cast(np.stack(batch_samples, axis=0), DTYPE)
                 
@@ -228,17 +199,6 @@ def train(args, params):
                 
                 # Stack shapes
                 stacked_shapes = tf.cast(np.stack(batch_shapes, axis=0), tf.float32)  # Shapes remain float32
-                
-                # Debug dtype info
-                if i < 2:
-                    print(f"Batch samples dtype: {stacked_samples.dtype}")
-                    print(f"Batch targets dtype: {stacked_targets.dtype}")
-                
-                # Debug info
-                if i < 5:
-                    print(f"[main_keras.py::data_generator] Batch samples shape: {stacked_samples.shape}")
-                    print(f"[main_keras.py::data_generator] Batch targets shape: {stacked_targets.shape}")
-                    print(f"[main_keras.py::data_generator] Batch shapes shape: {stacked_shapes.shape}")
                 
                 yield stacked_samples, stacked_targets, stacked_shapes
                 
@@ -262,7 +222,9 @@ def train(args, params):
     
     # Training loop
     best = 0
-    num_batch = math.ceil(len(train_dataset) / args.batch_size)
+    patience = 20  # Stop if no improvement for 20 epochs
+    patience_counter = 0
+    num_batch = len(train_dataset) // args.batch_size  # Floor division since we drop incomplete batches
     num_warmup = max(round(params['warmup_epochs'] * num_batch), 1000)
     
     # CSV logger
@@ -288,32 +250,6 @@ def train(args, params):
         for i, (samples, targets, shapes) in p_bar:
             x = i + num_batch * epoch
             
-            # Debug: Print data info for first few batches
-            if epoch == 0 and i < 3:
-                print(f"\n--- [main_keras.py::train] KERAS BATCH {i} DEBUG ---")
-                print(f"[main_keras.py::train] Samples shape: {samples.shape}")
-                print(f"[main_keras.py::train] Samples dtype: {samples.dtype}")
-                print(f"[main_keras.py::train] Samples min/max: {tf.reduce_min(samples):.3f}/{tf.reduce_max(samples):.3f}")
-                print(f"[main_keras.py::train] Targets shape: {targets.shape}")
-                print(f"[main_keras.py::train] Targets dtype: {targets.dtype}")
-                print(f"[main_keras.py::train] Number of targets: {tf.shape(targets)[0]}")
-                if tf.reduce_sum(tf.cast(targets[:, 0] > 0, tf.int32)) > 0:
-                    valid_targets = tf.boolean_mask(targets, targets[:, 0] > 0)
-                    print(f"[main_keras.py::train] Target sample: {valid_targets[:5] if len(valid_targets) > 0 else 'None'}")
-                print(f"[main_keras.py::train] Shapes: {shapes}")
-                print(f"[main_keras.py::train] Shapes type: {type(shapes)}")
-                print(f"[main_keras.py::train] Shapes dtype: {shapes.dtype}")
-                print(f"[main_keras.py::train] Shapes shape: {shapes.shape}")
-                
-                # Detailed shapes analysis
-                for batch_idx in range(min(shapes.shape[0], 2)):  # Check first 2 items in batch
-                    print(f"[main_keras.py::train] Batch item {batch_idx} shapes: {shapes[batch_idx]}")
-                    if shapes.shape[-1] >= 2 and shapes.shape[-2] >= 2:
-                        print(f"[main_keras.py::train] Batch item {batch_idx} original size: [{shapes[batch_idx, 0, 0]}, {shapes[batch_idx, 0, 1]}]")
-                        print(f"[main_keras.py::train] Batch item {batch_idx} ratio/padding: [{shapes[batch_idx, 1, 0]}, {shapes[batch_idx, 1, 1]}]")
-                    else:
-                        print(f"[main_keras.py::train] Batch item {batch_idx} unexpected shapes format: {shapes[batch_idx]}")
-            
             # Warmup - MATCH PYTORCH BEHAVIOR
             if x <= num_warmup:
                 xp = [0, num_warmup]
@@ -330,10 +266,6 @@ def train(args, params):
                 
                 optimizer.set_learning_rates(lr_bias, lr_weight, lr_bn)
                 
-                # Debug learning rates for first few steps
-                if epoch == 0 and i < 3:
-                    print(f"[main_keras.py::train] Warmup step {x}: bias_lr={lr_bias:.6f}, weight_lr={lr_weight:.6f}, bn_lr={lr_bn:.6f}")
-                
                 # Adjust momentum
                 momentum = np.interp(x, xp, [params['warmup_momentum'], params['momentum']])
                 # Note: momentum adjustment would need to be implemented in MultiGroupOptimizer
@@ -345,35 +277,11 @@ def train(args, params):
             # Forward pass
             with tf.GradientTape() as tape:
                 outputs = model(samples, training=True)
-                
-                # Debug: Print model outputs for first few batches
-                if epoch == 0 and i < 3:
-                    print(f"\n--- [main_keras.py::train] KERAS MODEL OUTPUT DEBUG ---")
-                    if isinstance(outputs, (list, tuple)):
-                        print(f"[main_keras.py::train] Number of output tensors: {len(outputs)}")
-                        for idx, out in enumerate(outputs):
-                            print(f"[main_keras.py::train] Output {idx} shape: {out.shape}")
-                            print(f"[main_keras.py::train] Output {idx} min/max: {tf.reduce_min(out):.6f}/{tf.reduce_max(out):.6f}")
-                            print(f"[main_keras.py::train] Output {idx} mean/std: {tf.reduce_mean(out):.6f}/{tf.math.reduce_std(out):.6f}")
-                    else:
-                        print(f"[main_keras.py::train] Output shape: {outputs.shape}")
-                        print(f"[main_keras.py::train] Output min/max: {tf.reduce_min(outputs):.6f}/{tf.reduce_max(outputs):.6f}")
-                        print(f"[main_keras.py::train] Output mean/std: {tf.reduce_mean(outputs):.6f}/{tf.math.reduce_std(outputs):.6f}")
-                
                 loss = criterion(outputs, targets)
-                
-                # Debug: Print loss details for first few batches
-                if epoch == 0 and i < 3:
-                    print(f"\n--- [main_keras.py::train] KERAS LOSS DEBUG ---")
-                    print(f"[main_keras.py::train] Loss value: {loss.numpy().item():.6f}")
-                    print(f"[main_keras.py::train] Loss dtype: {loss.dtype}")
                 
                 # Scale loss for multi-GPU (MATCH PYTORCH BEHAVIOR)
                 loss *= args.batch_size
                 # Note: world_size not available in Keras args, using batch_size only for single-GPU
-                
-                if epoch == 0 and i < 3:
-                    print(f"[main_keras.py::train] After scaling - Loss value: {loss.numpy().item():.6f}")
                 
                 m_loss.update(loss.numpy(), samples.shape[0])
 
@@ -425,8 +333,18 @@ def train(args, params):
             # Save model
             if val_mean_ap > best:
                 best = val_mean_ap
+                patience_counter = 0  # Reset counter on improvement
                 model.save_weights(os.path.join(args.save_path, 'best.weights.h5'))
+                print(f'Epoch {epoch + 1}: New best model saved (mAP: {best:.4f})')
+            else:
+                patience_counter += 1
+            
             model.save_weights(os.path.join(args.save_path, 'last.weights.h5'))
+            
+            # Early stopping check
+            if patience_counter >= patience:
+                print(f'\nEarly stopping triggered after {epoch + 1} epochs (no improvement for {patience} epochs)')
+                break
 
     csv_file.close()
 
@@ -445,39 +363,13 @@ def test(args, params, model=None, is_train=False):
         for i in range(len(dataset)):
             sample, target, shapes = dataset[i]
             
-            # DEBUG: Print test dataset output for first few samples
-            if i < 5:
-                print(f"\n--- [main_keras.py::test_data_generator] TEST DATASET OUTPUT DEBUG (sample {i}) ---")
-                print(f"[main_keras.py::test_data_generator] Sample shape: {sample.shape}")
-                print(f"[main_keras.py::test_data_generator] Target shape: {target.shape}")
-                print(f"[main_keras.py::test_data_generator] Shapes from dataset: {shapes}")
-                print(f"[main_keras.py::test_data_generator] Shapes type: {type(shapes)}")
-                print(f"[main_keras.py::test_data_generator] Shapes dtype: {shapes.dtype if hasattr(shapes, 'dtype') else 'N/A'}")
-                if hasattr(shapes, 'shape'):
-                    print(f"[main_keras.py::test_data_generator] Shapes shape: {shapes.shape}")
-                    if shapes.shape[0] >= 2 and shapes.shape[1] >= 2:
-                        print(f"[main_keras.py::test_data_generator] Original size: [{shapes[0, 0]}, {shapes[0, 1]}]")
-                        print(f"[main_keras.py::test_data_generator] Ratio/Padding: [{shapes[1, 0]}, {shapes[1, 1]}]")
-                    else:
-                        print(f"[main_keras.py::test_data_generator] Shapes content: {shapes}")
-                else:
-                    print(f"[main_keras.py::test_data_generator] Shapes content: {shapes}")
-            
             # Pad targets to maximum possible size (e.g., 100 objects max)
             max_objects = 100
             padded_target = np.zeros((max_objects, 6), dtype=np.float32)
             if target.shape[0] > 0:
                 n_objects = min(target.shape[0], max_objects)
                 padded_target[:n_objects] = target[:n_objects]
-                
-            # DEBUG: Print padded target info for first few samples
-            if i < 5:
-                print(f"[main_keras.py::test_data_generator] Padded target shape: {padded_target.shape}")
-                print(f"[main_keras.py::test_data_generator] Non-zero targets: {np.sum(padded_target[:, 0] > 0)}")
-                if np.sum(padded_target[:, 0] > 0) > 0:
-                    valid_targets = padded_target[padded_target[:, 0] > 0]
-                    print(f"[main_keras.py::test_data_generator] Valid targets sample: {valid_targets[:3] if len(valid_targets) > 0 else 'None'}")
-                    
+            
             sample = tf.cast(sample, DTYPE)
             padded_target = tf.cast(padded_target, DTYPE)
             shapes = tf.cast(shapes, tf.float32)
@@ -511,8 +403,13 @@ def test(args, params, model=None, is_train=False):
 
     for samples, targets, shapes in tqdm(loader, desc='Evaluating'):
         outputs = model(samples, training=False)
-        print(f"[main_keras.py::test] Model outputs shape: {outputs.shape if isinstance(outputs, tf.Tensor) else [o.shape for o in outputs]}")
         detections = non_max_suppression(outputs, 0.25, 0.45)
+        
+        # Scale GT coordinates from normalized to pixel space (matching PyTorch line 416)
+        _, h, w, _ = samples.shape
+        # targets format: [batch_idx, cls, x, y, w, h] -> scale cols 2:6 by (w, h, w, h)
+        scale_tensor = tf.constant([1.0, 1.0, float(w), float(h), float(w), float(h)], dtype=targets.dtype)
+        targets = targets * scale_tensor
         
         # Process each image in batch
         for i in range(samples.shape[0]):
@@ -541,7 +438,7 @@ def test(args, params, model=None, is_train=False):
                 # Scale ground truth boxes to original image size (like PyTorch version)
                 single_gt = []
                 if tf.shape(gt)[0] > 0:
-                    # Scale coordinates back to original image size
+                    # GT coordinates are now already in pixel space (scaled earlier)
                     gt_boxes = tf.identity(gt)  # Clone the tensor
                     h0, w0 = shapes[i][0]  # Original height, width
                     pad_info = shapes[i][2]  # Get padding values [pad_w, pad_h]
@@ -552,21 +449,21 @@ def test(args, params, model=None, is_train=False):
                     
                     class_ids = gt_boxes[:, 1]  # Class column
                     # Calculate scaled dimensions after removing padding
-                    scaled_w = w - 2 * pad_w
-                    scaled_h = h - 2 * pad_h
+                    scaled_w = float(w) - 2 * pad_w
+                    scaled_h = float(h) - 2 * pad_h
 
-                    # Compute scaling factors
+                    # Compute scaling factors from resized to original
                     scale_x = w0 / scaled_w if scaled_w > 0 else 1.0
                     scale_y = h0 / scaled_h if scaled_h > 0 else 1.0
 
-                    # Adjust coordinates (gt format: [img_idx, cls, x_center, y_center, width, height])
+                    # gt format: [batch_idx, cls, x_center, y_center, width, height] in PIXEL coords
                     coords = gt_boxes[:, 2:]  # Get [x_center, y_center, width, height]
                     
-                    # Convert normalized coordinates to pixel coordinates and scale
-                    x_center = (coords[:, 0] * w - pad_w) * scale_x  # x_center
-                    y_center = (coords[:, 1] * h - pad_h) * scale_y  # y_center
-                    width = coords[:, 2] * w * scale_x  # width
-                    height = coords[:, 3] * h * scale_y  # height
+                    # Coords are already in pixel space, just need to undo padding and scale to original
+                    x_center = (coords[:, 0] - pad_w) * scale_x
+                    y_center = (coords[:, 1] - pad_h) * scale_y
+                    width = coords[:, 2] * scale_x
+                    height = coords[:, 3] * scale_y
                     
                     # Recombine: [img_idx, cls, x_center, y_center, width, height]
                     for j in range(tf.shape(gt_boxes)[0]):
@@ -581,55 +478,6 @@ def test(args, params, model=None, is_train=False):
                     single_gt = tf.stack(single_gt)
                 else:
                     single_gt = tf.zeros((0, 6), dtype=tf.float32)
-
-                # DEBUG: Print shapes before visualize_predictions
-                print(f"\n=== DEBUG: visualize_predictions input shapes (vis_count={vis_count}) ===")
-                print(f"single_sample shape: {single_sample.shape}")
-                print(f"single_sample dtype: {single_sample.dtype}")
-                print(f"single_sample min/max: {tf.reduce_min(single_sample):.3f}/{tf.reduce_max(single_sample):.3f}")
-                
-                print(f"single_out type: {type(single_out)}")
-                if isinstance(single_out, list):
-                    print(f"single_out length: {len(single_out)}")
-                    for idx, out_item in enumerate(single_out):
-                        if out_item is not None:
-                            print(f"single_out[{idx}] shape: {out_item.shape}")
-                            print(f"single_out[{idx}] dtype: {out_item.dtype}")
-                            if hasattr(out_item, 'shape') and tf.size(out_item) > 0:
-                                print(f"single_out[{idx}] min/max: {tf.reduce_min(out_item):.6f}/{tf.reduce_max(out_item):.6f}")
-                            else:
-                                print(f"single_out[{idx}]: empty tensor")
-                        else:
-                            print(f"single_out[{idx}]: None")
-                else:
-                    print(f"single_out shape: {single_out.shape}")
-                    print(f"single_out dtype: {single_out.dtype}")
-                    if hasattr(single_out, 'shape') and tf.size(single_out) > 0:
-                        print(f"single_out min/max: {tf.reduce_min(single_out):.6f}/{tf.reduce_max(single_out):.6f}")
-                    else:
-                        print(f"single_out: empty tensor")
-                
-                print(f"single_gt shape: {single_gt.shape}")
-                print(f"single_gt dtype: {single_gt.dtype}")
-                if hasattr(single_gt, 'shape') and tf.size(single_gt) > 0:
-                    print(f"single_gt content (first few):")
-                    print(single_gt[:tf.minimum(3, tf.shape(single_gt)[0])])
-                else:
-                    print("single_gt: empty tensor")
-                
-                print(f"single_shapes: {single_shapes}")
-                print(f"shapes shape: {shapes.shape}")
-                print(f"single_shapes type: {type(single_shapes)}")
-                print(f"single_shapes dtype: {single_shapes.dtype}")
-                print(f"single_shapes shape: {single_shapes.shape}")
-                if hasattr(single_shapes, 'shape') and len(single_shapes.shape) > 0:
-                    print(f"single_shapes[0]: {single_shapes[0]}")
-                    if single_shapes.shape[-1] >= 2 and single_shapes.shape[-2] >= 2:
-                        print(f"single_shapes[0] original size: [{single_shapes[0, 0, 0]}, {single_shapes[0, 0, 1]}]")
-                        print(f"single_shapes[0] ratio/padding: [{single_shapes[0, 1, 0]}, {single_shapes[0, 1, 1]}]")
-                    else:
-                        print(f"single_shapes[0] unexpected format: {single_shapes[0]}")
-                print("=== END DEBUG ===")
                 
                 visualize_predictions(
                     single_sample,
@@ -668,13 +516,14 @@ def test(args, params, model=None, is_train=False):
             
             # Convert label xywh -> xyxy
             if len(gt_np) > 0:
-                # gt_np: (cls, x, y, w, h)
-                # convert to xyxy
-                label_boxes = gt_np.copy()
-                label_boxes[:, 1] = gt_np[:, 1] - gt_np[:, 3] / 2.0
-                label_boxes[:, 2] = gt_np[:, 2] - gt_np[:, 4] / 2.0
-                label_boxes[:, 3] = gt_np[:, 1] + gt_np[:, 3] / 2.0
-                label_boxes[:, 4] = gt_np[:, 2] + gt_np[:, 4] / 2.0
+                # gt_np format: [batch_idx, cls, x, y, w, h] (6 columns)
+                # We need: label_boxes = [cls, x1, y1, x2, y2] (5 columns)
+                label_boxes = np.zeros((len(gt_np), 5), dtype=gt_np.dtype)
+                label_boxes[:, 0] = gt_np[:, 1]  # cls
+                label_boxes[:, 1] = gt_np[:, 2] - gt_np[:, 4] / 2.0  # x1 = x - w/2
+                label_boxes[:, 2] = gt_np[:, 3] - gt_np[:, 5] / 2.0  # y1 = y - h/2
+                label_boxes[:, 3] = gt_np[:, 2] + gt_np[:, 4] / 2.0  # x2 = x + w/2
+                label_boxes[:, 4] = gt_np[:, 3] + gt_np[:, 5] / 2.0  # y2 = y + h/2
                 
                 # IoU vector for mAP@0.5:0.95
                 iou_v = np.linspace(0.5, 0.95, 10)
@@ -701,8 +550,8 @@ def test(args, params, model=None, is_train=False):
                             gt_box = t_tensor[gt_idx, 1:5]
                             gt_class = t_tensor[gt_idx, 0]
                             
-                            # Check class match
-                            if det_class == gt_class:
+                            # Check class match (round to handle floating point)
+                            if int(round(det_class)) == int(round(gt_class)):
                                 # Calculate IoU (simplified)
                                 x1 = max(det_box[0], gt_box[0])
                                 y1 = max(det_box[1], gt_box[1])
@@ -757,11 +606,11 @@ def main():
     parser.add_argument('--input-size', default='256', type=str)
     parser.add_argument('--batch-size', default=4, type=int)
     parser.add_argument('--local_rank', default=0, type=int)
-    parser.add_argument('--epochs', default=2, type=int)
+    parser.add_argument('--epochs', default=500, type=int)
     parser.add_argument('--train', action='store_true')
     parser.add_argument('--test', action='store_true')
     parser.add_argument('--yaml_file', type=str, default='utils/args_bionano.yaml')
-    parser.add_argument('--save-path', type=str, default='./results/rect_256x128_v5')
+    parser.add_argument('--save-path', type=str, default='./results/rect_256x128_cleaned')
     parser.add_argument('--dataset-dir', type=str, default='./Dataset/bionano_cellv2')
 
     args = parser.parse_args()

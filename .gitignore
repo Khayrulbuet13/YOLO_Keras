@@ -1,22 +1,31 @@
-# Python cache files
+# Python
 __pycache__/
 *.py[cod]
+*$py.class
+*.so
+.Python
 
-
-# Dataset directory (large files)
-
-
-# Model files and results
-results/
+# Training artifacts
+*.weights.h5
 *.pt
-*.h5
-
-# Cache files
+*.pth
+training_log*.txt
 *.cache
 
-# Secrets
-utils/secrets.json
+# Results
+results/*/
+!results/.gitkeep
 
-# IDE settings
+# IDEs
 .vscode/
-.history/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
