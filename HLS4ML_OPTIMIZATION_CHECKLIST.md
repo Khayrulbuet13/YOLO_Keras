@@ -193,7 +193,7 @@ layer_config = {
 ### 1. Train Quantized Model
 ```bash
 python main_keras.py --train --quantized \
-    --input-size 256x128 --batch-size 4 --epochs 500 \
+    --input-size 128x256 --batch-size 4 --epochs 500 \
     --save-path ./results/quantized_hls4ml
 ```
 

@@ -114,12 +114,51 @@ def train(args, params):
     # Initialize with central dtype
     num_classes = len(params['names'].values())
     
-    # Use quantized model if specified
-    if args.quantized:
+    # Initialize models based on training mode
+    if args.kd:
+        # Knowledge Distillation mode
+        print("[INFO] Using Knowledge Distillation training")
+        print(f"[INFO] Teacher: Full-precision model (frozen)")
+        
+        # Student model - use full-precision for debugging if flag is set
+        if args.debug_fp_student:
+            print(f"[INFO] Student: Full-precision model (DEBUG MODE - randomly initialized)")
+            model = yolo_v8_s(num_classes, img_size=args.img_size, dtype=DTYPE)
+        else:
+            print(f"[INFO] Student: Quantized model (trainable)")
+            model = yolo_v8_s_quantized(num_classes, img_size=args.img_size, dtype=DTYPE)
+        
+        # Teacher model (full-precision, frozen)
+        if not args.teacher_weights:
+            raise ValueError("--teacher-weights must be specified when using --kd mode")
+        
+        teacher_model = yolo_v8_s(num_classes, img_size=args.img_size, dtype=DTYPE)
+        
+        # Build teacher model with dummy input in training mode before loading weights
+        # This ensures the architecture matches how weights were originally saved
+        dummy_input = tf.zeros((1, args.img_size[0], args.img_size[1], 3), dtype=DTYPE)
+        _ = teacher_model(dummy_input, training=True)
+        
+        print(f"[INFO] Loading teacher weights from: {args.teacher_weights}")
+        try:
+            teacher_model.load_weights(args.teacher_weights)
+        except ValueError as e:
+            print(f"[WARNING] Error loading weights: {e}")
+            print("[INFO] Attempting to load with skip_mismatch=True")
+            teacher_model.load_weights(args.teacher_weights, skip_mismatch=True)
+        
+        teacher_model.trainable = False  # Freeze all teacher layers
+        
+        print(f"[INFO] KD hyperparameters: temperature={args.kd_temperature}, alpha={args.kd_alpha}, beta={args.kd_beta}")
+    elif args.quantized:
+        # Standard quantized training (no KD)
         print("[INFO] Using quantized model (QKeras) for HLS4ml FPGA synthesis")
         model = yolo_v8_s_quantized(num_classes, img_size=args.img_size, dtype=DTYPE)
+        teacher_model = None
     else:
-        model = yolo_v8_s(num_classes, img_size=args.img_size, dtype=DTYPE)  # Pass dtype to model
+        # Standard full-precision training
+        model = yolo_v8_s(num_classes, img_size=args.img_size, dtype=DTYPE)
+        teacher_model = None
     
     # Create model directory
     if args.local_rank == 0:
@@ -225,11 +264,22 @@ def train(args, params):
     ).prefetch(tf.data.AUTOTUNE)
     
     # Loss function with dtype
-    criterion = ComputeLoss(model, params, dtype=DTYPE)
+    if args.kd:
+        # Use KD loss for distillation
+        from utils.kd_loss import KDLoss
+        criterion = KDLoss(
+            temperature=args.kd_temperature,
+            alpha=args.kd_alpha,
+            beta=args.kd_beta,
+            dtype=DTYPE
+        )
+    else:
+        # Use standard detection loss
+        criterion = ComputeLoss(model, params, dtype=DTYPE)
     
     # Training loop
     best = 0
-    patience = 20  # Stop if no improvement for 20 epochs
+    patience = 100  # Stop if no improvement for 100 epochs
     patience_counter = 0
     num_batch = len(train_dataset) // args.batch_size  # Floor division since we drop incomplete batches
     num_warmup = max(round(params['warmup_epochs'] * num_batch), 1000)
@@ -237,12 +287,51 @@ def train(args, params):
     # CSV logger
     csv_path = os.path.join(args.save_path, 'step.csv')
     csv_file = open(csv_path, 'w', newline='')
-    writer = csv.DictWriter(csv_file, fieldnames=[
-        'epoch', 
-        'train_mAP@50', 'train_mAP', 'train_Precision', 'train_Recall', 'train_F1',
-        'val_mAP@50', 'val_mAP', 'val_Precision', 'val_Recall', 'val_F1'
-    ])
+    
+    # Add teacher metrics column if in KD mode
+    if args.kd:
+        fieldnames = [
+            'epoch', 
+            'teacher_train_mAP@50', 'teacher_train_mAP', 'teacher_val_mAP@50', 'teacher_val_mAP',
+            'train_mAP@50', 'train_mAP', 'train_Precision', 'train_Recall', 'train_F1',
+            'val_mAP@50', 'val_mAP', 'val_Precision', 'val_Recall', 'val_F1'
+        ]
+    else:
+        fieldnames = [
+            'epoch', 
+            'train_mAP@50', 'train_mAP', 'train_Precision', 'train_Recall', 'train_F1',
+            'val_mAP@50', 'val_mAP', 'val_Precision', 'val_Recall', 'val_F1'
+        ]
+    
+    writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
     writer.writeheader()
+    
+    # Evaluate teacher model before training (only for KD mode)
+    if args.kd and args.local_rank == 0:
+        print("\n" + "="*70)
+        print("EVALUATING TEACHER MODEL (to verify it loaded correctly)")
+        print("="*70)
+        
+        # Train evaluation
+        teacher_train_tp, teacher_train_fp, teacher_train_precision, teacher_train_recall, teacher_train_map50, teacher_train_mean_ap = test(args, params, teacher_model, is_train=True)
+        
+        # Validation evaluation
+        teacher_val_tp, teacher_val_fp, teacher_val_precision, teacher_val_recall, teacher_val_map50, teacher_val_mean_ap = test(args, params, teacher_model, is_train=False)
+        
+        print(f"\nTeacher Performance:")
+        print(f"  Train - mAP@50: {teacher_train_map50:.3f}, mAP: {teacher_train_mean_ap:.3f}")
+        print(f"  Val   - mAP@50: {teacher_val_map50:.3f}, mAP: {teacher_val_mean_ap:.3f}")
+        print("="*70 + "\n")
+        
+        # Store teacher metrics for logging
+        teacher_metrics = {
+            'train_map50': teacher_train_map50,
+            'train_mean_ap': teacher_train_mean_ap,
+            'val_map50': teacher_val_map50,
+            'val_mean_ap': teacher_val_mean_ap
+        }
+    else:
+        teacher_metrics = None
 
     for epoch in range(args.epochs):
         m_loss = AverageMeter()
@@ -283,8 +372,37 @@ def train(args, params):
 
             # Forward pass
             with tf.GradientTape() as tape:
-                outputs = model(samples, training=True)
-                loss = criterion(outputs, targets)
+                if args.kd:
+                    # Knowledge Distillation: get teacher outputs (no gradient tracking)
+                    teacher_outputs = teacher_model(samples, training=True)
+                    
+                    # Get student outputs (with gradient tracking)
+                    student_outputs = model(samples, training=True)
+                    
+                    # Debug logging for first batch of first epoch
+                    if epoch == 0 and i == 0:
+                        print(f"\n[DEBUG] First batch KD outputs:")
+                        print(f"  Teacher output shape: {teacher_outputs.shape}")
+                        print(f"  Teacher output range: [{teacher_outputs.numpy().min():.4f}, {teacher_outputs.numpy().max():.4f}]")
+                        print(f"  Teacher output mean: {teacher_outputs.numpy().mean():.4f}")
+                        print(f"  Student output shape: {student_outputs.shape}")
+                        print(f"  Student output range: [{student_outputs.numpy().min():.4f}, {student_outputs.numpy().max():.4f}]")
+                        print(f"  Student output mean: {student_outputs.numpy().mean():.4f}")
+                    
+                    # Compute KD loss between teacher and student
+                    loss = criterion(student_outputs, teacher_outputs)
+                    
+                    # Log loss values periodically
+                    if i % 50 == 0:
+                        loss_val = loss.numpy()
+                        if np.isnan(loss_val) or np.isinf(loss_val):
+                            print(f"\n[WARNING] Batch {i}: Loss is {loss_val}!")
+                        elif i == 0:
+                            print(f"[INFO] Epoch {epoch+1}, Batch {i}: KD Loss = {loss_val:.6f}")
+                else:
+                    # Standard training with detection loss
+                    outputs = model(samples, training=True)
+                    loss = criterion(outputs, targets)
                 
                 # Scale loss for multi-GPU (MATCH PYTORCH BEHAVIOR)
                 loss *= args.batch_size
@@ -309,7 +427,8 @@ def train(args, params):
             eval_model = model
             if ema:
                 # Create a temporary model with EMA weights
-                if args.quantized:
+                # Use quantized model for KD or quantized training (unless debug mode)
+                if (args.kd and not args.debug_fp_student) or args.quantized:
                     eval_model = yolo_v8_s_quantized(num_classes, img_size=args.img_size)
                 else:
                     eval_model = yolo_v8_s(num_classes, img_size=args.img_size)
@@ -325,7 +444,7 @@ def train(args, params):
             val_f1 = 2 * val_precision * val_recall / (val_precision + val_recall + 1e-16)
 
             # Log results
-            writer.writerow({
+            row_data = {
                 'epoch': str(epoch + 1).zfill(3),
                 'train_mAP@50': f'{train_map50:.3f}',
                 'train_mAP': f'{train_mean_ap:.3f}',
@@ -337,7 +456,16 @@ def train(args, params):
                 'val_Precision': f'{val_precision:.3f}',
                 'val_Recall': f'{val_recall:.3f}',
                 'val_F1': f'{val_f1:.3f}'
-            })
+            }
+            
+            # Add teacher metrics if in KD mode
+            if args.kd and teacher_metrics is not None:
+                row_data['teacher_train_mAP@50'] = f'{teacher_metrics["train_map50"]:.3f}'
+                row_data['teacher_train_mAP'] = f'{teacher_metrics["train_mean_ap"]:.3f}'
+                row_data['teacher_val_mAP@50'] = f'{teacher_metrics["val_map50"]:.3f}'
+                row_data['teacher_val_mAP'] = f'{teacher_metrics["val_mean_ap"]:.3f}'
+            
+            writer.writerow(row_data)
             csv_file.flush()
 
             # Save model
@@ -623,6 +751,12 @@ def main():
     parser.add_argument('--train', action='store_true')
     parser.add_argument('--test', action='store_true')
     parser.add_argument('--quantized', action='store_true', help='Use QKeras quantized model for HLS4ml FPGA synthesis')
+    parser.add_argument('--kd', action='store_true', help='Enable Knowledge Distillation training')
+    parser.add_argument('--teacher-weights', type=str, help='Path to pretrained teacher weights for KD')
+    parser.add_argument('--kd-temperature', default=3.0, type=float, help='KD temperature for softening distributions')
+    parser.add_argument('--kd-alpha', default=0.5, type=float, help='Weight for box KD loss')
+    parser.add_argument('--kd-beta', default=0.5, type=float, help='Weight for class KD loss')
+    parser.add_argument('--debug-fp-student', action='store_true', help='Use full-precision student for KD debugging')
     parser.add_argument('--yaml_file', type=str, default='utils/args_bionano.yaml')
     parser.add_argument('--save-path', type=str, default='./results/rect_256x128_cleaned')
     parser.add_argument('--dataset-dir', type=str, default='./Dataset/bionano_cellv2')

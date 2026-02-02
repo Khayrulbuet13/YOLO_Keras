@@ -67,7 +67,7 @@ Train your model using quantization-aware training:
 python main_keras.py \
     --train \
     --quantized \
-    --input-size 256x128 \
+    --input-size 128x256 \
     --batch-size 4 \
     --epochs 500 \
     --save-path ./results/quantized_model \
@@ -300,7 +300,7 @@ First, ensure the quantized model maintains accuracy:
 python main_keras.py \
     --test \
     --quantized \
-    --input-size 256x128 \
+    --input-size 128x256 \
     --save-path ./results/quantized_model \
     --dataset-dir ./Dataset/bionano_cellv2
 ```
