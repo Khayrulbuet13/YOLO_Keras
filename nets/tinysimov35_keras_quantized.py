@@ -31,14 +31,16 @@ class QConv(layers.Layer):
         )
         
         # Quantized ReLU activation with proper integer bits
+        # For activation_bits=24: 6 integer + 18 fractional = range [0, 64)
         # For activation_bits=16: 4 integer + 12 fractional = range [0, 16)
         # For activation_bits=8: 2 integer + 6 fractional = range [0, 4)
         # For activation_bits=12: 3 integer + 9 fractional = range [0, 8)
         integer_bits = max(2, activation_bits // 4)  # Use ~25% for integer part
         self.relu = QActivation(quantized_relu(activation_bits, integer_bits), dtype=dtype)
 
-    def call(self, x):
-        return self.relu(self.norm(self.conv(x)))
+    def call(self, x, training=None):
+        # CRITICAL: Pass training to BatchNorm for correct running stats behavior
+        return self.relu(self.norm(self.conv(x), training=training))
 
 class QDarkNet(Model):
     """Quantized DarkNet backbone"""
@@ -46,8 +48,10 @@ class QDarkNet(Model):
         super().__init__(dtype=dtype)
         self.dtype_ = dtype
         self.layers_list = []
+        self.stage_indices = []  # Track which layers end each stage
         in_ch = widths[0]
         
+        layer_idx = 0
         for i in range(min(len(depths), len(widths) - 1)):
             out_ch = widths[i + 1]
             nblocks = depths[i]
@@ -55,15 +59,10 @@ class QDarkNet(Model):
             for j in range(nblocks):
                 stride = 2 if (j == nblocks - 1 and i < len(depths) - 1) else 1
                 
-                # Use 16-bit for first layer (more sensitive to quantization)
-                # Use 8-bit for middle layers
-                # Use 12-bit for last layers (before head)
-                if i == 0 and j == 0:
-                    weight_bits, activation_bits = 16, 16
-                elif i >= len(depths) - 1:
-                    weight_bits, activation_bits = 12, 12
-                else:
-                    weight_bits, activation_bits = 8, 8
+                # Use 24-bit for all layers (very high precision, ~FP32)
+                # Testing if quantization is fundamentally broken
+                # 32-bit caused NaN, so trying 24-bit
+                weight_bits, activation_bits = 24, 24
                 
                 self.layers_list.append(
                     QConv(in_ch, out_ch, 3, stride, 
@@ -72,13 +71,29 @@ class QDarkNet(Model):
                           dtype=dtype)
                 )
                 in_ch = out_ch
+                layer_idx += 1
+            
+            # Mark the end of this stage
+            self.stage_indices.append(layer_idx - 1)
         
         self.out_channels = in_ch
 
-    def call(self, x):
-        for layer in self.layers_list:
-            x = layer(x)
-        return x
+    def call(self, x, training=None, return_intermediates=False):
+        # CRITICAL: Pass training to QConv layers for correct BatchNorm behavior
+        if return_intermediates:
+            intermediates = {}
+            for i, layer in enumerate(self.layers_list):
+                x = layer(x, training=training)
+                # Save output after each stage
+                if i in self.stage_indices:
+                    stage_num = self.stage_indices.index(i)
+                    intermediates[f'backbone_stage_{stage_num}'] = x
+            intermediates['backbone_final'] = x
+            return intermediates
+        else:
+            for layer in self.layers_list:
+                x = layer(x, training=training)
+            return x
 
 class QDFL(layers.Layer):
     """Quantized Distribution Focal Loss layer
@@ -129,7 +144,7 @@ class QHead(Model):
         self.no = nc + self.ch * 4
         
         # Quantized conv block before head
-        self.conv = QConv(ch_in, 24, 1, 1, weight_bits=12, activation_bits=12, dtype=dtype)
+        self.conv = QConv(ch_in, 24, 1, 1, weight_bits=24, activation_bits=24, dtype=dtype)
         
         # DFL layer
         self.dfl = QDFL(self.ch, dtype=dtype)
@@ -137,17 +152,27 @@ class QHead(Model):
         # Box and class prediction heads (quantized) with auto-learned range
         self.box = QConv2D(
             4 * self.ch, 1, 
-            kernel_quantizer=quantized_bits(12, 0, alpha='auto'),
+            kernel_quantizer=quantized_bits(24, 0, alpha='auto'),
             dtype=dtype
         )
         self.cls = QConv2D(
             nc, 1,
-            kernel_quantizer=quantized_bits(12, 0, alpha='auto'),
+            kernel_quantizer=quantized_bits(24, 0, alpha='auto'),
             dtype=dtype
         )
 
-    def call(self, x, training=False):
-        if training:
+    def call(self, x, training=None, return_intermediates=False):
+        if return_intermediates:
+            intermediates = {}
+            # Apply conv transformation - CRITICAL: pass training for BatchNorm
+            conv_out = self.conv(x, training=training)
+            intermediates['head_conv'] = conv_out
+            # Apply box and cls heads to the original input (not conv output)
+            box_out = self.box(x)
+            cls_out = self.cls(x)
+            intermediates['output'] = tf.concat([box_out, cls_out], axis=-1)
+            return intermediates
+        elif training:
             # Training path: simple concatenation for loss computation
             return tf.concat([self.box(x), self.cls(x)], axis=-1)
         else:
@@ -222,9 +247,17 @@ class QYOLO(Model):
         # Initialize biases
         self.initialize_biases()
         
-    def call(self, x, training=False):
-        features = self.net(x)
-        return self.head(features, training=training)
+    def call(self, x, training=None, return_intermediates=False):
+        if return_intermediates:
+            # Collect all intermediate features - CRITICAL: pass training to all layers
+            intermediates = self.net(x, training=training, return_intermediates=True)
+            backbone_final = intermediates['backbone_final']
+            head_intermediates = self.head(backbone_final, training=training, return_intermediates=True)
+            intermediates.update(head_intermediates)
+            return intermediates
+        else:
+            features = self.net(x, training=training)
+            return self.head(features, training=training)
     
     def calculate_stride(self, img_size):
         dummy_img = tf.zeros((1, *img_size), dtype=self.dtype_)

@@ -155,19 +155,220 @@ def train(args, params):
                 # Build student model first
                 _ = model(dummy_input, training=True)
                 
-                # Copy weights from teacher to student (layer by layer)
+                # Simple weight copy (works better than alpha manipulation for QKeras)
+                # QKeras alpha='auto' learns scale factors during training
                 teacher_weights = teacher_model.get_weights()
                 student_weights = model.get_weights()
                 
-                # Copy compatible weights (same shape)
                 copied_count = 0
-                for i, (tw, sw) in enumerate(zip(teacher_weights, student_weights)):
-                    if tw.shape == sw.shape:
-                        student_weights[i] = tw
+                for i in range(min(len(teacher_weights), len(student_weights))):
+                    if teacher_weights[i].shape == student_weights[i].shape:
+                        student_weights[i] = teacher_weights[i]
                         copied_count += 1
                 
                 model.set_weights(student_weights)
-                print(f"[INFO] Copied {copied_count}/{len(student_weights)} weights from teacher to student")
+                print(f"[INFO] Copied {copied_count}/{len(student_weights)} weights from teacher")
+                
+                # CRITICAL FIX: Reset BatchNorm running statistics
+                # The copied running stats from FP teacher are wrong for quantized features
+                # Reset to defaults (mean=0, var=1) so they're properly learned during training
+                print(f"[INFO] Resetting BatchNorm running stats for quantized model...")
+                bn_reset_count = 0
+                
+                def reset_bn_layer(bn_layer):
+                    """Safely reset a BatchNorm layer's running stats"""
+                    nonlocal bn_reset_count
+                    if bn_layer is None:
+                        return
+                    if hasattr(bn_layer, 'moving_mean') and bn_layer.moving_mean is not None:
+                        bn_layer.moving_mean.assign(tf.zeros_like(bn_layer.moving_mean))
+                        bn_layer.moving_variance.assign(tf.ones_like(bn_layer.moving_variance))
+                        bn_reset_count += 1
+                
+                # Reset BN in backbone layers (QConv blocks in layers_list)
+                if hasattr(model, 'net') and hasattr(model.net, 'layers_list'):
+                    for qconv in model.net.layers_list:
+                        if hasattr(qconv, 'norm') and qconv.norm is not None:
+                            reset_bn_layer(qconv.norm)
+                
+                # Reset BN in head conv if it exists and has a norm
+                if hasattr(model, 'head') and hasattr(model.head, 'conv'):
+                    conv = model.head.conv
+                    if conv is not None and hasattr(conv, 'norm') and conv.norm is not None:
+                        reset_bn_layer(conv.norm)
+                
+                print(f"[INFO] Reset {bn_reset_count} BatchNorm layers")
+                
+                # #region agent log - H7: Verify CLS layer weights specifically
+                import json
+                log_path_h7 = '/home/mdi220/simulations/YOLO_Keras/.cursor/debug.log'
+                def debug_log_h7(msg, data, hyp):
+                    with open(log_path_h7, 'a') as f:
+                        f.write(json.dumps({"location": "main_keras.py:weight_copy", "message": msg, "data": data, "hypothesisId": hyp, "sessionId": "debug-session"}) + '\n')
+                
+                # Get cls layer weights from both models
+                teacher_cls_kernel = teacher_model.head.cls.kernel.numpy()
+                student_cls_kernel = model.head.cls.kernel.numpy()
+                teacher_box_kernel = teacher_model.head.box.kernel.numpy()
+                student_box_kernel = model.head.box.kernel.numpy()
+                
+                # Check if they match
+                cls_match = np.allclose(teacher_cls_kernel, student_cls_kernel, atol=0.01)
+                box_match = np.allclose(teacher_box_kernel, student_box_kernel, atol=0.01)
+                
+                debug_log_h7("H7_weight_verification", {
+                    "teacher_cls_shape": list(teacher_cls_kernel.shape),
+                    "student_cls_shape": list(student_cls_kernel.shape),
+                    "cls_weights_match": bool(cls_match),
+                    "cls_max_diff": float(np.max(np.abs(teacher_cls_kernel - student_cls_kernel))),
+                    "teacher_box_shape": list(teacher_box_kernel.shape),
+                    "student_box_shape": list(student_box_kernel.shape),
+                    "box_weights_match": bool(box_match),
+                    "box_max_diff": float(np.max(np.abs(teacher_box_kernel - student_box_kernel))),
+                }, "H7")
+                
+                # Also verify cls output directly
+                cls_teacher_out = teacher_model.head.cls(teacher_model.net(dummy_input)).numpy()
+                cls_student_out = model.head.cls(model.net(dummy_input)).numpy()
+                
+                debug_log_h7("H7_cls_output_comparison", {
+                    "teacher_cls_out_range": [float(cls_teacher_out.min()), float(cls_teacher_out.max())],
+                    "student_cls_out_range": [float(cls_student_out.min()), float(cls_student_out.max())],
+                    "cls_out_match": bool(np.allclose(cls_teacher_out, cls_student_out, atol=0.1)),
+                    "cls_out_max_diff": float(np.max(np.abs(cls_teacher_out - cls_student_out))),
+                    "cls_correlation": float(np.corrcoef(cls_teacher_out.flatten(), cls_student_out.flatten())[0, 1]),
+                }, "H7")
+                
+                # H8: Compare backbone outputs with training=True vs training=False
+                # This tests if BN running statistics cause the discrepancy
+                backbone_teacher_train = teacher_model.net(dummy_input, training=True).numpy()
+                backbone_teacher_eval = teacher_model.net(dummy_input, training=False).numpy()
+                backbone_student_train = model.net(dummy_input, training=True).numpy()
+                backbone_student_eval = model.net(dummy_input, training=False).numpy()
+                
+                debug_log_h7("H8_backbone_train_mode", {
+                    "teacher_range": [float(backbone_teacher_train.min()), float(backbone_teacher_train.max())],
+                    "student_range": [float(backbone_student_train.min()), float(backbone_student_train.max())],
+                    "correlation": float(np.corrcoef(backbone_teacher_train.flatten(), backbone_student_train.flatten())[0, 1]),
+                    "max_diff": float(np.max(np.abs(backbone_teacher_train - backbone_student_train))),
+                }, "H8")
+                
+                debug_log_h7("H8_backbone_eval_mode", {
+                    "teacher_range": [float(backbone_teacher_eval.min()), float(backbone_teacher_eval.max())],
+                    "student_range": [float(backbone_student_eval.min()), float(backbone_student_eval.max())],
+                    "correlation": float(np.corrcoef(backbone_teacher_eval.flatten(), backbone_student_eval.flatten())[0, 1]),
+                    "max_diff": float(np.max(np.abs(backbone_teacher_eval - backbone_student_eval))),
+                }, "H8")
+                
+                # Also test full model cls outputs in EVAL mode specifically
+                full_teacher_eval = teacher_model(dummy_input, training=False).numpy()
+                full_student_eval = model(dummy_input, training=False).numpy()
+                
+                # Extract just the confidence (last column)
+                teacher_conf_eval = full_teacher_eval[0, :, 4]
+                student_conf_eval = full_student_eval[0, :, 4]
+                
+                debug_log_h7("H8_full_model_eval_confidence", {
+                    "teacher_conf_range": [float(teacher_conf_eval.min()), float(teacher_conf_eval.max())],
+                    "student_conf_range": [float(student_conf_eval.min()), float(student_conf_eval.max())],
+                    "conf_correlation": float(np.corrcoef(teacher_conf_eval, student_conf_eval)[0, 1]),
+                    "conf_max_diff": float(np.max(np.abs(teacher_conf_eval - student_conf_eval))),
+                }, "H8")
+                # #endregion
+                
+                # Verify initialization worked
+                test_output = model(dummy_input, training=True)
+                teacher_test = teacher_model(dummy_input, training=True)
+                print(f"[INFO] Output range check - Teacher: [{teacher_test.numpy().min():.2f}, {teacher_test.numpy().max():.2f}], "
+                      f"Student: [{test_output.numpy().min():.2f}, {test_output.numpy().max():.2f}]")
+                
+                # #region agent log - H1/H3/H6: Compare training vs eval mode outputs after init
+                import json
+                log_path = '/home/mdi220/simulations/YOLO_Keras/.cursor/debug.log'
+                def debug_log_init(msg, data, hyp):
+                    with open(log_path, 'a') as f:
+                        f.write(json.dumps({"location": "main_keras.py:init", "message": msg, "data": data, "hypothesisId": hyp, "sessionId": "debug-session"}) + '\n')
+                
+                # Test training=True vs training=False for BOTH models
+                student_train = model(dummy_input, training=True).numpy()
+                student_eval = model(dummy_input, training=False).numpy()
+                teacher_train = teacher_model(dummy_input, training=True).numpy()
+                teacher_eval = teacher_model(dummy_input, training=False).numpy()
+                
+                debug_log_init("student_train_vs_eval_after_init", {
+                    "train_shape": list(student_train.shape),
+                    "eval_shape": list(student_eval.shape),
+                    "train_min": float(student_train.min()),
+                    "train_max": float(student_train.max()),
+                    "eval_min": float(student_eval.min()),
+                    "eval_max": float(student_eval.max()),
+                    "train_mean": float(student_train.mean()),
+                    "eval_mean": float(student_eval.mean()),
+                }, "H3")
+                
+                debug_log_init("teacher_train_vs_eval", {
+                    "train_shape": list(teacher_train.shape),
+                    "eval_shape": list(teacher_eval.shape),
+                    "train_min": float(teacher_train.min()),
+                    "train_max": float(teacher_train.max()),
+                    "eval_min": float(teacher_eval.min()),
+                    "eval_max": float(teacher_eval.max()),
+                    "train_mean": float(teacher_train.mean()),
+                    "eval_mean": float(teacher_eval.mean()),
+                }, "H3")
+                
+                # Check correlation in EVAL mode
+                if student_eval.shape == teacher_eval.shape:
+                    flat_s = student_eval.flatten()
+                    flat_t = teacher_eval.flatten()
+                    corr = np.corrcoef(flat_s, flat_t)[0, 1]
+                    mean_diff = np.mean(np.abs(flat_s - flat_t))
+                    debug_log_init("eval_mode_correlation", {
+                        "correlation": float(corr) if not np.isnan(corr) else "NaN",
+                        "mean_abs_diff": float(mean_diff),
+                    }, "H3")
+                    
+                    # H6: Compare CLASS CONFIDENCES specifically (last column in eval mode)
+                    # Eval output shape: [batch, num_anchors, 5] where last column is class conf
+                    student_conf = student_eval[0, :, 4]  # class confidences
+                    teacher_conf = teacher_eval[0, :, 4]  # class confidences
+                    
+                    # Count how many pass threshold
+                    threshold = 0.25
+                    student_above = np.sum(student_conf > threshold)
+                    teacher_above = np.sum(teacher_conf > threshold)
+                    
+                    # Compare confidence distributions
+                    debug_log_init("H6_confidence_comparison", {
+                        "student_conf_max": float(student_conf.max()),
+                        "student_conf_mean": float(student_conf.mean()),
+                        "student_above_threshold": int(student_above),
+                        "teacher_conf_max": float(teacher_conf.max()),
+                        "teacher_conf_mean": float(teacher_conf.mean()),
+                        "teacher_above_threshold": int(teacher_above),
+                        "conf_correlation": float(np.corrcoef(student_conf, teacher_conf)[0, 1]),
+                        "conf_mean_diff": float(np.mean(teacher_conf - student_conf)),
+                    }, "H6")
+                    
+                    # Also compare box coordinates (first 4 columns)
+                    student_boxes = student_eval[0, :, :4]
+                    teacher_boxes = teacher_eval[0, :, :4]
+                    debug_log_init("H6_box_comparison", {
+                        "box_mean_abs_diff": float(np.mean(np.abs(student_boxes - teacher_boxes))),
+                        "box_max_diff": float(np.max(np.abs(student_boxes - teacher_boxes))),
+                    }, "H6")
+                else:
+                    debug_log_init("eval_mode_shape_mismatch", {
+                        "student_shape": list(student_eval.shape),
+                        "teacher_shape": list(teacher_eval.shape),
+                    }, "H3")
+                # #endregion
+        
+        # If using intermediate KD, build models with return_intermediates to ensure consistent structure
+        if args.use_intermediate_kd:
+            print(f"[INFO] Building models with intermediate feature extraction...")
+            _ = teacher_model(dummy_input, training=True, return_intermediates=True)
+            _ = model(dummy_input, training=True, return_intermediates=True)
         
         print(f"[INFO] KD hyperparameters: temperature={args.kd_temperature}, alpha={args.kd_alpha}, beta={args.kd_beta}")
     elif args.quantized:
@@ -201,6 +402,26 @@ def train(args, params):
     
     # EMA
     ema = EMA(model) if args.local_rank == 0 else None
+    
+    # #region agent log - H2: Log EMA initialization state
+    import json
+    log_path = '/home/mdi220/simulations/YOLO_Keras/.cursor/debug.log'
+    def debug_log_train(msg, data, hyp):
+        with open(log_path, 'a') as f:
+            f.write(json.dumps({"location": "main_keras.py:train", "message": msg, "data": data, "hypothesisId": hyp, "sessionId": "debug-session"}) + '\n')
+    
+    if ema and args.kd and args.init_from_teacher:
+        # Check if EMA captured teacher weights
+        ema_weights = ema.ema_weights
+        model_weights = model.get_weights()
+        debug_log_train("ema_initialization_check", {
+            "ema_weight_count": len(ema_weights),
+            "model_weight_count": len(model_weights),
+            "first_weight_ema_sum": float(np.sum(np.abs(ema_weights[0].numpy()))),
+            "first_weight_model_sum": float(np.sum(np.abs(model_weights[0]))),
+            "weights_match": bool(np.allclose(ema_weights[0].numpy(), model_weights[0])),
+        }, "H2")
+    # #endregion
     
     # Datasets
     train_filenames = []
@@ -291,6 +512,10 @@ def train(args, params):
             temperature=args.kd_temperature,
             alpha=args.kd_alpha,
             beta=args.kd_beta,
+            use_intermediate_kd=args.use_intermediate_kd,
+            intermediate_weight=args.intermediate_kd_weight,
+            calibration_weight=args.calibration_weight,
+            conf_threshold=0.25,  # Match NMS threshold
             dtype=DTYPE
         )
     else:
@@ -313,13 +538,13 @@ def train(args, params):
         fieldnames = [
             'epoch', 
             'teacher_train_mAP@50', 'teacher_train_mAP', 'teacher_val_mAP@50', 'teacher_val_mAP',
-            'train_mAP@50', 'train_mAP', 'train_Precision', 'train_Recall', 'train_F1',
+            'train_loss', 'train_mAP@50', 'train_mAP', 'train_Precision', 'train_Recall', 'train_F1',
             'val_mAP@50', 'val_mAP', 'val_Precision', 'val_Recall', 'val_F1'
         ]
     else:
         fieldnames = [
             'epoch', 
-            'train_mAP@50', 'train_mAP', 'train_Precision', 'train_Recall', 'train_F1',
+            'train_loss', 'train_mAP@50', 'train_mAP', 'train_Precision', 'train_Recall', 'train_F1',
             'val_mAP@50', 'val_mAP', 'val_Precision', 'val_Recall', 'val_F1'
         ]
     
@@ -393,24 +618,138 @@ def train(args, params):
             # Forward pass
             with tf.GradientTape() as tape:
                 if args.kd:
-                    # Knowledge Distillation: get teacher outputs (no gradient tracking)
-                    teacher_outputs = teacher_model(samples, training=True)
-                    
-                    # Get student outputs (with gradient tracking)
-                    student_outputs = model(samples, training=True)
-                    
-                    # Debug logging for first batch of first epoch
-                    if epoch == 0 and i == 0:
-                        print(f"\n[DEBUG] First batch KD outputs:")
-                        print(f"  Teacher output shape: {teacher_outputs.shape}")
-                        print(f"  Teacher output range: [{teacher_outputs.numpy().min():.4f}, {teacher_outputs.numpy().max():.4f}]")
-                        print(f"  Teacher output mean: {teacher_outputs.numpy().mean():.4f}")
-                        print(f"  Student output shape: {student_outputs.shape}")
-                        print(f"  Student output range: [{student_outputs.numpy().min():.4f}, {student_outputs.numpy().max():.4f}]")
-                        print(f"  Student output mean: {student_outputs.numpy().mean():.4f}")
-                    
-                    # Compute KD loss between teacher and student
-                    loss = criterion(student_outputs, teacher_outputs)
+                    # Knowledge Distillation mode
+                    if args.use_intermediate_kd:
+                        # Per-layer KD: extract intermediate features
+                        teacher_intermediates = teacher_model(samples, training=True, return_intermediates=True)
+                        teacher_outputs = teacher_intermediates.pop('output')
+                        
+                        student_intermediates = model(samples, training=True, return_intermediates=True)
+                        student_outputs = student_intermediates.pop('output')
+                        
+                        # Debug logging for first batch of first epoch
+                        if epoch == 0 and i == 0:
+                            print(f"\n[DEBUG] First batch KD with intermediates:")
+                            print(f"  Teacher output shape: {teacher_outputs.shape}")
+                            print(f"  Teacher output range: [{teacher_outputs.numpy().min():.4f}, {teacher_outputs.numpy().max():.4f}]")
+                            print(f"  Teacher intermediate layers: {list(teacher_intermediates.keys())}")
+                            print(f"  Student output shape: {student_outputs.shape}")
+                            print(f"  Student output range: [{student_outputs.numpy().min():.4f}, {student_outputs.numpy().max():.4f}]")
+                            print(f"  Student intermediate layers: {list(student_intermediates.keys())}")
+                            
+                            # Log quantizer alpha values if available
+                            if args.init_from_teacher:
+                                print(f"\n[DEBUG] Quantizer alpha values (sampling layers):")
+                                alpha_count = 0
+                                for layer in model.layers[:20]:  # Check first 20 layers
+                                    # Check for QConv wrapper (nested quantizer)
+                                    if hasattr(layer, 'conv') and hasattr(layer.conv, 'kernel_quantizer'):
+                                        quantizer = layer.conv.kernel_quantizer
+                                        if hasattr(quantizer, 'alpha'):
+                                            alpha_val = quantizer.alpha
+                                            if isinstance(alpha_val, tf.Variable):
+                                                alpha_val = alpha_val.numpy()
+                                            print(f"    {layer.name}.conv: alpha={alpha_val:.6f}")
+                                            alpha_count += 1
+                                    # Check for direct QConv2D
+                                    elif hasattr(layer, 'kernel_quantizer') and hasattr(layer.kernel_quantizer, 'alpha'):
+                                        alpha_val = layer.kernel_quantizer.alpha
+                                        if isinstance(alpha_val, tf.Variable):
+                                            alpha_val = alpha_val.numpy()
+                                        print(f"    {layer.name}: alpha={alpha_val:.6f}")
+                                        alpha_count += 1
+                                if alpha_count == 0:
+                                    print(f"    (No quantizers found in first 20 layers)")
+                        
+                        # Compute KD loss with intermediate features
+                        loss = criterion(student_outputs, teacher_outputs, 
+                                       student_intermediates, teacher_intermediates)
+                        
+                        # #region agent log - H13: Log calibration effect (intermediate KD path)
+                        if epoch == 0 and i == 0:
+                            nc = 1
+                            s_box, s_cls = tf.split(student_outputs, [64, nc], axis=-1)
+                            t_box, t_cls = tf.split(teacher_outputs, [64, nc], axis=-1)
+                            s_probs = tf.nn.sigmoid(s_cls).numpy()
+                            t_probs = tf.nn.sigmoid(t_cls).numpy()
+                            
+                            s_above = (s_probs > 0.25).sum()
+                            t_above = (t_probs > 0.25).sum()
+                            false_positives = ((s_probs > 0.25) & (t_probs < 0.25)).sum()
+                            
+                            debug_log_train("H13_calibration_check", {
+                                "student_above_threshold": int(s_above),
+                                "teacher_above_threshold": int(t_above),
+                                "false_positive_count": int(false_positives),
+                                "student_conf_max": float(s_probs.max()),
+                                "teacher_conf_max": float(t_probs.max()),
+                                "loss_value": float(loss.numpy()),
+                            }, "H13")
+                        # #endregion
+                    else:
+                        # Output-only KD (original behavior)
+                        teacher_outputs = teacher_model(samples, training=True)
+                        student_outputs = model(samples, training=True)
+                        
+                        # Debug logging for first batch of first epoch
+                        if epoch == 0 and i == 0:
+                            print(f"\n[DEBUG] First batch KD outputs:")
+                            print(f"  Teacher output shape: {teacher_outputs.shape}")
+                            print(f"  Teacher output range: [{teacher_outputs.numpy().min():.4f}, {teacher_outputs.numpy().max():.4f}]")
+                            print(f"  Teacher output mean: {teacher_outputs.numpy().mean():.4f}")
+                            print(f"  Student output shape: {student_outputs.shape}")
+                            print(f"  Student output range: [{student_outputs.numpy().min():.4f}, {student_outputs.numpy().max():.4f}]")
+                            print(f"  Student output mean: {student_outputs.numpy().mean():.4f}")
+                            
+                            # Log quantizer alpha values if available
+                            if args.init_from_teacher:
+                                print(f"\n[DEBUG] Quantizer alpha values (sampling layers):")
+                                alpha_count = 0
+                                for layer in model.layers[:20]:  # Check first 20 layers
+                                    # Check for QConv wrapper (nested quantizer)
+                                    if hasattr(layer, 'conv') and hasattr(layer.conv, 'kernel_quantizer'):
+                                        quantizer = layer.conv.kernel_quantizer
+                                        if hasattr(quantizer, 'alpha'):
+                                            alpha_val = quantizer.alpha
+                                            if isinstance(alpha_val, tf.Variable):
+                                                alpha_val = alpha_val.numpy()
+                                            print(f"    {layer.name}.conv: alpha={alpha_val:.6f}")
+                                            alpha_count += 1
+                                    # Check for direct QConv2D
+                                    elif hasattr(layer, 'kernel_quantizer') and hasattr(layer.kernel_quantizer, 'alpha'):
+                                        alpha_val = layer.kernel_quantizer.alpha
+                                        if isinstance(alpha_val, tf.Variable):
+                                            alpha_val = alpha_val.numpy()
+                                        print(f"    {layer.name}: alpha={alpha_val:.6f}")
+                                        alpha_count += 1
+                                if alpha_count == 0:
+                                    print(f"    (No quantizers found in first 20 layers)")
+                        
+                        # Compute KD loss between teacher and student
+                        loss = criterion(student_outputs, teacher_outputs)
+                        
+                        # #region agent log - H13: Log calibration loss effect
+                        if epoch == 0 and i == 0:
+                            # Compute individual loss components for logging
+                            nc = 1
+                            s_box, s_cls = tf.split(student_outputs, [64, nc], axis=-1)
+                            t_box, t_cls = tf.split(teacher_outputs, [64, nc], axis=-1)
+                            s_probs = tf.nn.sigmoid(s_cls).numpy()
+                            t_probs = tf.nn.sigmoid(t_cls).numpy()
+                            
+                            s_above = (s_probs > 0.25).sum()
+                            t_above = (t_probs > 0.25).sum()
+                            false_positives = ((s_probs > 0.25) & (t_probs < 0.25)).sum()
+                            
+                            debug_log_train("H13_calibration_loss_check", {
+                                "student_above_threshold": int(s_above),
+                                "teacher_above_threshold": int(t_above),
+                                "false_positive_count": int(false_positives),
+                                "student_conf_max": float(s_probs.max()),
+                                "teacher_conf_max": float(t_probs.max()),
+                                "loss_value": float(loss.numpy()),
+                            }, "H13")
+                        # #endregion
                     
                     # Log loss values periodically
                     if i % 50 == 0:
@@ -418,7 +757,8 @@ def train(args, params):
                         if np.isnan(loss_val) or np.isinf(loss_val):
                             print(f"\n[WARNING] Batch {i}: Loss is {loss_val}!")
                         elif i == 0:
-                            print(f"[INFO] Epoch {epoch+1}, Batch {i}: KD Loss = {loss_val:.6f}")
+                            mode_str = "Per-layer KD" if args.use_intermediate_kd else "Output-only KD"
+                            print(f"[INFO] Epoch {epoch+1}, Batch {i}: {mode_str} Loss = {loss_val:.6f}")
                 else:
                     # Standard training with detection loss
                     outputs = model(samples, training=True)
@@ -449,11 +789,40 @@ def train(args, params):
                 # Create a temporary model with EMA weights
                 # Use quantized model for KD or quantized training (unless debug mode)
                 if (args.kd and not args.debug_fp_student) or args.quantized:
-                    eval_model = yolo_v8_s_quantized(num_classes, img_size=args.img_size)
+                    eval_model = yolo_v8_s_quantized(num_classes, img_size=args.img_size, dtype=DTYPE)
                 else:
-                    eval_model = yolo_v8_s(num_classes, img_size=args.img_size)
-                # Directly apply EMA weights
-                eval_model.set_weights([w.numpy() for w in ema.ema_weights])
+                    eval_model = yolo_v8_s(num_classes, img_size=args.img_size, dtype=DTYPE)
+                
+                # Build eval model with same structure as training model
+                if args.kd and args.use_intermediate_kd:
+                    # Build with return_intermediates to match training model structure
+                    _ = eval_model(dummy_input, training=True, return_intermediates=True)
+                else:
+                    # Build normally
+                    _ = eval_model(dummy_input, training=True)
+                
+                # Check weight counts before applying
+                ema_weight_count = len(ema.ema_weights)
+                eval_weight_count = len(eval_model.get_weights())
+                
+                if ema_weight_count == eval_weight_count:
+                    eval_model.set_weights([w.numpy() for w in ema.ema_weights])
+                else:
+                    # Weight count mismatch - use training model directly
+                    print(f"[WARN] EMA weight count ({ema_weight_count}) != eval model ({eval_weight_count}), using training model for eval")
+                    eval_model = model
+                
+                # #region agent log - H2: Compare training model vs eval model outputs
+                eval_test = eval_model(dummy_input, training=False).numpy()
+                train_model_eval = model(dummy_input, training=False).numpy()
+                debug_log_train("eval_model_vs_train_model", {
+                    "eval_model_min": float(eval_test.min()),
+                    "eval_model_max": float(eval_test.max()),
+                    "train_model_min": float(train_model_eval.min()),
+                    "train_model_max": float(train_model_eval.max()),
+                    "outputs_match": bool(np.allclose(eval_test, train_model_eval, atol=0.01)),
+                }, "H2")
+                # #endregion
             
             # Train evaluation
             train_tp, train_fp, train_precision, train_recall, train_map50, train_mean_ap = test(args, params, eval_model, is_train=True)
@@ -463,9 +832,61 @@ def train(args, params):
             val_tp, val_fp, val_precision, val_recall, val_map50, val_mean_ap = test(args, params, eval_model, is_train=False)
             val_f1 = 2 * val_precision * val_recall / (val_precision + val_recall + 1e-16)
 
+            # #region agent log - H10/H11/H12: Compare teacher vs student on real images
+            if args.kd and teacher_model is not None and epoch == 0:
+                # Load a sample of real training images
+                sample_batch = next(iter(train_loader))
+                real_samples = sample_batch[0]
+                real_targets = sample_batch[1]
+                
+                # Get teacher and student predictions in eval mode
+                teacher_preds = teacher_model(real_samples, training=False).numpy()
+                student_preds = eval_model(real_samples, training=False).numpy()
+                
+                # Compare boxes (first 4 columns) and confidence (5th column)
+                teacher_boxes = teacher_preds[:, :, :4]
+                student_boxes = student_preds[:, :, :4]
+                teacher_conf = teacher_preds[:, :, 4]
+                student_conf = student_preds[:, :, 4]
+                
+                # Box comparison
+                box_diff = np.abs(teacher_boxes - student_boxes)
+                box_correlation = np.corrcoef(teacher_boxes.flatten(), student_boxes.flatten())[0, 1]
+                
+                # Confidence comparison
+                conf_diff = np.abs(teacher_conf - student_conf)
+                conf_correlation = np.corrcoef(teacher_conf.flatten(), student_conf.flatten())[0, 1]
+                
+                # Get NMS detections for both
+                from utils.util_keras import non_max_suppression
+                teacher_dets = non_max_suppression(tf.constant(teacher_preds), 0.25, 0.45)
+                student_dets = non_max_suppression(tf.constant(student_preds), 0.25, 0.45)
+                
+                teacher_det_counts = [len(d) if d is not None else 0 for d in teacher_dets]
+                student_det_counts = [len(d) if d is not None else 0 for d in student_dets]
+                
+                debug_log_train("H10_H11_H12_real_image_comparison", {
+                    "box_mean_diff": float(box_diff.mean()),
+                    "box_max_diff": float(box_diff.max()),
+                    "box_correlation": float(box_correlation),
+                    "conf_mean_diff": float(conf_diff.mean()),
+                    "conf_max_diff": float(conf_diff.max()),
+                    "conf_correlation": float(conf_correlation),
+                    "teacher_conf_max": float(teacher_conf.max()),
+                    "teacher_conf_mean": float(teacher_conf.mean()),
+                    "student_conf_max": float(student_conf.max()),
+                    "student_conf_mean": float(student_conf.mean()),
+                    "teacher_det_counts": teacher_det_counts,
+                    "student_det_counts": student_det_counts,
+                    "teacher_total_dets": sum(teacher_det_counts),
+                    "student_total_dets": sum(student_det_counts),
+                }, "H10_H11_H12")
+            # #endregion
+
             # Log results
             row_data = {
                 'epoch': str(epoch + 1).zfill(3),
+                'train_loss': f'{m_loss.avg:.6f}',
                 'train_mAP@50': f'{train_map50:.3f}',
                 'train_mAP': f'{train_mean_ap:.3f}',
                 'train_Precision': f'{train_precision:.3f}',
@@ -507,6 +928,14 @@ def train(args, params):
     csv_file.close()
 
 def test(args, params, model=None, is_train=False):
+    # #region agent log - H1/H2/H3/H4/H5: Debug model behavior in eval mode
+    import json
+    log_path = '/home/mdi220/simulations/YOLO_Keras/.cursor/debug.log'
+    def debug_log(msg, data, hyp):
+        with open(log_path, 'a') as f:
+            f.write(json.dumps({"location": "main_keras.py:test", "message": msg, "data": data, "hypothesisId": hyp, "sessionId": "debug-session"}) + '\n')
+    # #endregion
+    
     # Load dataset
     filenames = []
     split = 'train' if is_train else 'val'
@@ -564,8 +993,39 @@ def test(args, params, model=None, is_train=False):
 
     total_detections = 0
     total_images = 0
+    first_batch_logged = False
     for samples, targets, shapes in tqdm(loader, desc='Evaluating'):
         outputs = model(samples, training=False)
+        
+        # #region agent log - H3/H4: Log first batch eval outputs
+        if not first_batch_logged:
+            out_np = outputs.numpy()
+            debug_log("eval_output_first_batch", {
+                "split": split,
+                "output_shape": list(out_np.shape),
+                "output_min": float(out_np.min()),
+                "output_max": float(out_np.max()),
+                "output_mean": float(out_np.mean()),
+                "has_nan": bool(np.isnan(out_np).any()),
+                "has_inf": bool(np.isinf(out_np).any()),
+                "sample_values_first10": out_np[0, 0, :10].tolist(),
+            }, "H3")
+            
+            # Also log training=True output for comparison
+            train_outputs = model(samples, training=True)
+            train_np = train_outputs.numpy()
+            debug_log("train_output_first_batch_for_comparison", {
+                "split": split,
+                "output_shape": list(train_np.shape),
+                "output_min": float(train_np.min()),
+                "output_max": float(train_np.max()),
+                "output_mean": float(train_np.mean()),
+                "has_nan": bool(np.isnan(train_np).any()),
+                "sample_values_first10": train_np[0, 0, :10].tolist(),
+            }, "H3")
+            first_batch_logged = True
+        # #endregion
+        
         detections = non_max_suppression(outputs, 0.25, 0.45)
         
         # Debug: count detections
@@ -573,6 +1033,17 @@ def test(args, params, model=None, is_train=False):
             if det is not None and len(det) > 0:
                 total_detections += len(det)
         total_images += len(detections)
+        
+        # #region agent log - H4: Log detection counts for first batch
+        if total_images == len(detections):  # First batch
+            det_counts = [len(d) if d is not None else 0 for d in detections]
+            debug_log("nms_detections_first_batch", {
+                "split": split,
+                "detection_counts_per_image": det_counts,
+                "total_detections": sum(det_counts),
+                "conf_threshold": 0.25,
+            }, "H4")
+        # #endregion
         
         # Scale GT coordinates from normalized to pixel space (matching PyTorch line 416)
         _, h, w, _ = samples.shape
@@ -785,8 +1256,12 @@ def main():
     parser.add_argument('--kd-temperature', default=3.0, type=float, help='KD temperature for softening distributions')
     parser.add_argument('--kd-alpha', default=0.5, type=float, help='Weight for box KD loss')
     parser.add_argument('--kd-beta', default=0.5, type=float, help='Weight for class KD loss')
+    parser.add_argument('--use-intermediate-kd', action='store_true', help='Enable per-layer KD on intermediate features')
+    parser.add_argument('--intermediate-kd-weight', default=0.3, type=float, help='Weight for intermediate KD loss')
+    parser.add_argument('--calibration-weight', default=2.0, type=float, help='Weight for confidence calibration loss (reduces false positives)')
     parser.add_argument('--debug-fp-student', action='store_true', help='Use full-precision student for KD debugging')
     parser.add_argument('--init-from-teacher', action='store_true', help='Initialize quantized student from teacher weights')
+    parser.add_argument('--validate-quantization', action='store_true', help='Validate quantized model activation ranges after initialization')
     parser.add_argument('--yaml_file', type=str, default='utils/args_bionano.yaml')
     parser.add_argument('--save-path', type=str, default='./results/rect_256x128_cleaned')
     parser.add_argument('--dataset-dir', type=str, default='./Dataset/bionano_cellv2')

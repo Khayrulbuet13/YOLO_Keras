@@ -26,8 +26,10 @@ class DarkNet(Model):
         super().__init__(dtype=dtype)
         self.dtype_ = dtype  # Store as different attribute name
         self.layers_list = []
+        self.stage_indices = []  # Track which layers end each stage
         in_ch = widths[0]
         
+        layer_idx = 0
         for i in range(min(len(depths), len(widths) - 1)):
             out_ch = widths[i + 1]
             nblocks = depths[i]
@@ -36,13 +38,28 @@ class DarkNet(Model):
                 stride = 2 if (j == nblocks - 1 and i < len(depths) - 1) else 1
                 self.layers_list.append(Conv(in_ch, out_ch, 3, stride, dtype=dtype))
                 in_ch = out_ch
+                layer_idx += 1
+            
+            # Mark the end of this stage
+            self.stage_indices.append(layer_idx - 1)
         
         self.out_channels = in_ch
 
-    def call(self, x):
-        for layer in self.layers_list:
-            x = layer(x)
-        return x
+    def call(self, x, return_intermediates=False):
+        if return_intermediates:
+            intermediates = {}
+            for i, layer in enumerate(self.layers_list):
+                x = layer(x)
+                # Save output after each stage
+                if i in self.stage_indices:
+                    stage_num = self.stage_indices.index(i)
+                    intermediates[f'backbone_stage_{stage_num}'] = x
+            intermediates['backbone_final'] = x
+            return intermediates
+        else:
+            for layer in self.layers_list:
+                x = layer(x)
+            return x
 
 class DFL(layers.Layer):
     def __init__(self, ch=16, dtype=tf.float32):
@@ -75,8 +92,18 @@ class Head(Model):
         self.box = layers.Conv2D(4 * self.ch, 1, dtype=dtype)
         self.cls = layers.Conv2D(nc, 1, dtype=dtype)
 
-    def call(self, x, training=False):
-        if training:
+    def call(self, x, training=False, return_intermediates=False):
+        if return_intermediates:
+            intermediates = {}
+            # Apply conv transformation
+            conv_out = self.conv(x)
+            intermediates['head_conv'] = conv_out
+            # Apply box and cls heads to the original input (not conv output)
+            box_out = self.box(x)
+            cls_out = self.cls(x)
+            intermediates['output'] = tf.concat([box_out, cls_out], axis=-1)
+            return intermediates
+        elif training:
             return tf.concat([self.box(x), self.cls(x)], axis=-1)  # Normal training path
         else:
             # Inference: Match PyTorch's reshape flow
@@ -151,9 +178,17 @@ class YOLO(Model):
         # Initialize biases now that layers exist
         self.initialize_biases()
         
-    def call(self, x, training=False):
-        features = self.net(x)
-        return self.head(features, training=training)
+    def call(self, x, training=False, return_intermediates=False):
+        if return_intermediates:
+            # Collect all intermediate features
+            intermediates = self.net(x, return_intermediates=True)
+            backbone_final = intermediates['backbone_final']
+            head_intermediates = self.head(backbone_final, training=training, return_intermediates=True)
+            intermediates.update(head_intermediates)
+            return intermediates
+        else:
+            features = self.net(x)
+            return self.head(features, training=training)
     
     def calculate_stride(self, img_size):
         dummy_img = tf.zeros((1, *img_size), dtype=self.dtype_)

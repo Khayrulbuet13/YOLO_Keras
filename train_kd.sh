@@ -15,8 +15,12 @@ EPOCHS=1000
 KD_TEMPERATURE=1.0
 KD_ALPHA=0.5
 KD_BETA=0.5
-SAVE_PATH="./results/rect_256x128_KDwithFP"
+SAVE_PATH="./results/rect_256x128_KDwith_each_layer"
 DATASET_DIR="./Dataset/bionano_cellv2"
+
+# Per-layer KD options (disabled for this run)
+# USE_INTERMEDIATE_KD="--use-intermediate-kd"
+# INTERMEDIATE_KD_WEIGHT=0.3
 
 # Check if teacher weights exist
 if [ ! -f "$TEACHER_WEIGHTS" ]; then
@@ -31,9 +35,11 @@ echo "Teacher weights: $TEACHER_WEIGHTS"
 echo "Input size: $INPUT_SIZE"
 echo "Batch size: $BATCH_SIZE"
 echo "Epochs: $EPOCHS"
+echo "Quantization: 24-bit (high precision - testing if quant is broken)"
 echo "KD temperature: $KD_TEMPERATURE"
 echo "KD alpha (box): $KD_ALPHA"
 echo "KD beta (class): $KD_BETA"
+echo "Per-layer KD: DISABLED (output-only)"
 echo "Save path: $SAVE_PATH"
 echo "========================================"
 

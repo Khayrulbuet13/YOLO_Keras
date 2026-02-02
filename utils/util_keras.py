@@ -440,9 +440,20 @@ class EMA:
         d = self.decay_fn(self.updates)
         model_weights = self.model.get_weights()
         
+        # Handle case where model structure might have changed
+        if len(model_weights) != len(self.ema_weights):
+            # Reinitialize EMA weights if model structure changed
+            self.ema_weights = [tf.Variable(w, dtype=self.model.dtype) for w in model_weights]
+            return
+        
         for i, w in enumerate(self.ema_weights):
             if tf.as_dtype(w.dtype).is_floating:
-                w.assign(w * d + (1 - d) * model_weights[i])
+                # Check shape compatibility before updating
+                if w.shape == model_weights[i].shape:
+                    w.assign(w * d + (1 - d) * model_weights[i])
+                else:
+                    # Shape mismatch - reinitialize this weight
+                    w.assign(model_weights[i])
     
     def set_weights_to_model(self, model=None):
         """Apply EMA weights to the model"""
