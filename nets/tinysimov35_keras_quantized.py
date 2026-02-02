@@ -11,15 +11,15 @@ class QConv(layers.Layer):
         self.dtype_ = dtype
         padding = 'same' if p is None else 'valid'
         
-        # Quantized convolution
-        # Use more bits for first layer (more sensitive)
+        # Quantized convolution with auto-learned quantization range
+        # alpha='auto' allows the quantizer to learn appropriate scale factors
         self.conv = QConv2D(
             out_ch, k, strides=s, 
             padding=padding,
             dilation_rate=d,
             groups=g,
             use_bias=False,
-            kernel_quantizer=quantized_bits(weight_bits, 0, alpha=1),
+            kernel_quantizer=quantized_bits(weight_bits, 0, alpha='auto'),
             dtype=dtype
         )
         
@@ -30,8 +30,12 @@ class QConv(layers.Layer):
             dtype=dtype
         )
         
-        # Quantized ReLU activation
-        self.relu = QActivation(quantized_relu(activation_bits, 0), dtype=dtype)
+        # Quantized ReLU activation with proper integer bits
+        # For activation_bits=16: 4 integer + 12 fractional = range [0, 16)
+        # For activation_bits=8: 2 integer + 6 fractional = range [0, 4)
+        # For activation_bits=12: 3 integer + 9 fractional = range [0, 8)
+        integer_bits = max(2, activation_bits // 4)  # Use ~25% for integer part
+        self.relu = QActivation(quantized_relu(activation_bits, integer_bits), dtype=dtype)
 
     def call(self, x):
         return self.relu(self.norm(self.conv(x)))
@@ -130,15 +134,15 @@ class QHead(Model):
         # DFL layer
         self.dfl = QDFL(self.ch, dtype=dtype)
         
-        # Box and class prediction heads (quantized)
+        # Box and class prediction heads (quantized) with auto-learned range
         self.box = QConv2D(
             4 * self.ch, 1, 
-            kernel_quantizer=quantized_bits(12, 0, alpha=1),
+            kernel_quantizer=quantized_bits(12, 0, alpha='auto'),
             dtype=dtype
         )
         self.cls = QConv2D(
             nc, 1,
-            kernel_quantizer=quantized_bits(12, 0, alpha=1),
+            kernel_quantizer=quantized_bits(12, 0, alpha='auto'),
             dtype=dtype
         )
 

@@ -120,14 +120,6 @@ def train(args, params):
         print("[INFO] Using Knowledge Distillation training")
         print(f"[INFO] Teacher: Full-precision model (frozen)")
         
-        # Student model - use full-precision for debugging if flag is set
-        if args.debug_fp_student:
-            print(f"[INFO] Student: Full-precision model (DEBUG MODE - randomly initialized)")
-            model = yolo_v8_s(num_classes, img_size=args.img_size, dtype=DTYPE)
-        else:
-            print(f"[INFO] Student: Quantized model (trainable)")
-            model = yolo_v8_s_quantized(num_classes, img_size=args.img_size, dtype=DTYPE)
-        
         # Teacher model (full-precision, frozen)
         if not args.teacher_weights:
             raise ValueError("--teacher-weights must be specified when using --kd mode")
@@ -148,6 +140,34 @@ def train(args, params):
             teacher_model.load_weights(args.teacher_weights, skip_mismatch=True)
         
         teacher_model.trainable = False  # Freeze all teacher layers
+        
+        # Student model - use full-precision for debugging if flag is set
+        if args.debug_fp_student:
+            print(f"[INFO] Student: Full-precision model (DEBUG MODE - randomly initialized)")
+            model = yolo_v8_s(num_classes, img_size=args.img_size, dtype=DTYPE)
+        else:
+            print(f"[INFO] Student: Quantized model (trainable)")
+            model = yolo_v8_s_quantized(num_classes, img_size=args.img_size, dtype=DTYPE)
+            
+            # Initialize quantized student from teacher weights for faster convergence
+            if args.init_from_teacher:
+                print(f"[INFO] Initializing quantized student from teacher weights...")
+                # Build student model first
+                _ = model(dummy_input, training=True)
+                
+                # Copy weights from teacher to student (layer by layer)
+                teacher_weights = teacher_model.get_weights()
+                student_weights = model.get_weights()
+                
+                # Copy compatible weights (same shape)
+                copied_count = 0
+                for i, (tw, sw) in enumerate(zip(teacher_weights, student_weights)):
+                    if tw.shape == sw.shape:
+                        student_weights[i] = tw
+                        copied_count += 1
+                
+                model.set_weights(student_weights)
+                print(f"[INFO] Copied {copied_count}/{len(student_weights)} weights from teacher to student")
         
         print(f"[INFO] KD hyperparameters: temperature={args.kd_temperature}, alpha={args.kd_alpha}, beta={args.kd_beta}")
     elif args.quantized:
@@ -542,9 +562,17 @@ def test(args, params, model=None, is_train=False):
     metrics = []
     vis_count = 0
 
+    total_detections = 0
+    total_images = 0
     for samples, targets, shapes in tqdm(loader, desc='Evaluating'):
         outputs = model(samples, training=False)
         detections = non_max_suppression(outputs, 0.25, 0.45)
+        
+        # Debug: count detections
+        for det in detections:
+            if det is not None and len(det) > 0:
+                total_detections += len(det)
+        total_images += len(detections)
         
         # Scale GT coordinates from normalized to pixel space (matching PyTorch line 416)
         _, h, w, _ = samples.shape
@@ -734,6 +762,7 @@ def test(args, params, model=None, is_train=False):
     else:
         tp = fp = m_pre = m_rec = map50 = mean_ap = 0
 
+    print(f'[EVAL] Total images: {total_images}, Total detections: {total_detections} ({total_detections/max(total_images,1):.2f} per image)')
     print(f'Precision: {m_pre:.3f}, Recall: {m_rec:.3f}, mAP50: {map50:.3f}, mAP: {mean_ap:.3f}')
     return tp, fp, m_pre, m_rec, map50, mean_ap
 
@@ -757,6 +786,7 @@ def main():
     parser.add_argument('--kd-alpha', default=0.5, type=float, help='Weight for box KD loss')
     parser.add_argument('--kd-beta', default=0.5, type=float, help='Weight for class KD loss')
     parser.add_argument('--debug-fp-student', action='store_true', help='Use full-precision student for KD debugging')
+    parser.add_argument('--init-from-teacher', action='store_true', help='Initialize quantized student from teacher weights')
     parser.add_argument('--yaml_file', type=str, default='utils/args_bionano.yaml')
     parser.add_argument('--save-path', type=str, default='./results/rect_256x128_cleaned')
     parser.add_argument('--dataset-dir', type=str, default='./Dataset/bionano_cellv2')

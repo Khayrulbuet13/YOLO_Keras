@@ -11,11 +11,11 @@ source ~/.virtualenvs/yolo/bin/activate
 TEACHER_WEIGHTS="results/rect_256x128_cleaned/best.weights.h5"
 INPUT_SIZE="128x256"
 BATCH_SIZE=4
-EPOCHS=200
-KD_TEMPERATURE=3.0
+EPOCHS=1000
+KD_TEMPERATURE=1.0
 KD_ALPHA=0.5
 KD_BETA=0.5
-SAVE_PATH="./results/rect_256x128_kd"
+SAVE_PATH="./results/rect_256x128_KDwithFP"
 DATASET_DIR="./Dataset/bionano_cellv2"
 
 # Check if teacher weights exist
@@ -42,6 +42,7 @@ python3 main_keras.py \
     --kd \
     --teacher-weights "$TEACHER_WEIGHTS" \
     --quantized \
+    --init-from-teacher \
     --input-size "$INPUT_SIZE" \
     --batch-size $BATCH_SIZE \
     --epochs $EPOCHS \
