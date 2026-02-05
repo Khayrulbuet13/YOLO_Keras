@@ -29,3 +29,9 @@ Thumbs.db
 
 # Jupyter
 .ipynb_checkpoints/
+
+# Ignore everything in Dataset folder
+/Dataset/**
+
+# Other files
+qkeras

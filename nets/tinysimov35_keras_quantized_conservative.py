@@ -1,3 +1,11 @@
+"""
+Conservative Quantized YOLO Model - Less Aggressive Quantization
+
+This version uses uniform 8-bit quantization across all layers for better
+initial convergence. Once this trains successfully, you can try more
+aggressive quantization.
+"""
+
 import tensorflow as tf
 from tensorflow.keras import layers, Model
 import math
@@ -17,17 +25,18 @@ from qkeras import (
 # 3. This is the recommended approach in QKeras examples for HLS4ml deployment
 
 class QConv(layers.Layer):
-    """Quantized Conv block with QKeras layers - Stable Training Version"""
-    def __init__(self, in_ch, out_ch, k=1, s=1, p=None, d=1, g=1, 
-                 weight_bits=8, activation_bits=8, dtype=tf.float32):
+    """Quantized Conv block with QKeras layers - Conservative 8-bit version"""
+    def __init__(self, in_ch, out_ch, k=1, s=1, p=None, d=1, g=1, dtype=tf.float32):
         super().__init__()
         self.dtype_ = dtype
         padding = 'same' if p is None else 'valid'
         
-        # Quantized convolution with FIXED alpha for training stability
-        # alpha=1 prevents scale divergence that causes loss explosion
-        # Integer bits: 3 for weights (range [-8, 8]), 4 for activations (range [0, 16])
-        integer_bits = 3  # Fixed: sufficient for normalized weights
+        # Uniform 8-bit quantization for all layers
+        # 2 integer bits = [-2, 2] range (good for normalized weights)
+        weight_bits = 8
+        integer_bits = 2
+        activation_bits = 8
+        act_integer_bits = 3  # [0, 8] range for ReLU outputs
         
         self.conv = QConv2D(
             out_ch, k, strides=s, 
@@ -35,29 +44,25 @@ class QConv(layers.Layer):
             dilation_rate=d,
             groups=g,
             use_bias=False,
-            kernel_quantizer=quantized_bits(weight_bits, integer_bits, symmetric=1, alpha=1)
+            kernel_quantizer=quantized_bits(weight_bits, integer_bits, symmetric=1, alpha='auto_po2')
         )
         
         # Batch Normalization (will be fused with Conv in HLS4ml)
-        # Using regular BN due to QBatchNormalization/Keras 3.x compatibility issues
-        # HLS4ml will quantize the fused Conv+BN operation based on Conv quantizers
         self.norm = layers.BatchNormalization(
             epsilon=0.001, 
             momentum=0.03
         )
         
-        # Quantized ReLU activation with fixed alpha
-        # Integer bits: 4 for activations (range [0, 16])
-        act_integer_bits = 4
+        # Quantized ReLU activation
         self.relu = QActivation(quantized_relu(activation_bits, act_integer_bits))
 
     def call(self, x):
         return self.relu(self.norm(self.conv(x)))
 
 class QDarkNet(Model):
-    """Quantized DarkNet backbone"""
+    """Quantized DarkNet backbone - Conservative version"""
     def __init__(self, widths=None, depths=None, dtype=tf.float32):
-        super().__init__(dtype=dtype)
+        super().__init__()
         self.dtype_ = dtype
         self.layers_list = []
         in_ch = widths[0]
@@ -69,15 +74,9 @@ class QDarkNet(Model):
             for j in range(nblocks):
                 stride = 2 if (j == nblocks - 1 and i < len(depths) - 1) else 1
                 
-                # Uniform 8-bit quantization for training stability
-                # Mixed bit-widths with learnable scales cause gradient instability
-                weight_bits, activation_bits = 8, 8
-                
+                # Uniform 8-bit for all layers
                 self.layers_list.append(
-                    QConv(in_ch, out_ch, 3, stride, 
-                          weight_bits=weight_bits, 
-                          activation_bits=activation_bits,
-                          dtype=dtype)
+                    QConv(in_ch, out_ch, 3, stride, dtype=dtype)
                 )
                 in_ch = out_ch
         
@@ -89,25 +88,19 @@ class QDarkNet(Model):
         return x
 
 class QDFL(layers.Layer):
-    """Quantized Distribution Focal Loss layer
-    
-    Note: This layer uses softmax which is expensive on FPGA.
-    For HLS4ml synthesis, consider replacing with simpler operations.
-    """
+    """Quantized Distribution Focal Loss layer"""
     def __init__(self, ch=16, dtype=tf.float32):
-        super().__init__(dtype=dtype)
+        super().__init__()
         self.dtype_ = dtype
         self.ch = ch
         
-        # Quantized convolution for DFL
-        # This layer holds [0..15] range, so needs integer bits
-        # Use fixed alpha=1 for stability
+        # 8-bit quantization with 4 integer bits for [0..15] range
         self.conv = QConv2D(
             1, 1, 
             use_bias=False, 
             kernel_initializer='zeros', 
             trainable=False,
-            kernel_quantizer=quantized_bits(8, 4, symmetric=1, alpha=1)
+            kernel_quantizer=quantized_bits(8, 4, symmetric=1, alpha='auto_po2')
         )
     
     def build(self, input_shape):
@@ -116,64 +109,44 @@ class QDFL(layers.Layer):
         self.conv.kernel.assign(kernel)
     
     def call(self, x):
-        """PyTorch equivalent: sum(softmax(channel_axis) * [0..15])
-        
-        WARNING: Softmax is resource-intensive on FPGA.
-        For production FPGA deployment, consider approximating or replacing.
-        """
         x = tf.nn.softmax(x, axis=-1)
         return self.conv(x)
 
 class QHead(Model):
-    """Quantized detection head
-    
-    Training mode: Returns raw predictions for loss computation
-    Inference mode: Returns processed detections (boxes + class scores)
-    """
+    """Quantized detection head - Conservative version"""
     def __init__(self, nc=20, ch_in=128, dtype=tf.float32):
-        super().__init__(dtype=dtype)
+        super().__init__()
         self.dtype_ = dtype
         self.nc = nc
         self.ch = 16
         self.no = nc + self.ch * 4
         
-        # Quantized conv block before head - uniform 8-bit
-        self.conv = QConv(ch_in, 24, 1, 1, weight_bits=8, activation_bits=8, dtype=dtype)
-        
-        # DFL layer
+        # Uniform 8-bit quantization
+        self.conv = QConv(ch_in, 24, 1, 1, dtype=dtype)
         self.dfl = QDFL(self.ch, dtype=dtype)
         
-        # Box and class prediction heads - uniform 8-bit with fixed alpha
+        # Box and class prediction heads - 8-bit uniform
         self.box = QConv2D(
             4 * self.ch, 1,
-            kernel_quantizer=quantized_bits(8, 3, symmetric=1, alpha=1),
-            bias_quantizer=quantized_bits(8, 3, symmetric=1, alpha=1)
+            kernel_quantizer=quantized_bits(8, 2, symmetric=1, alpha='auto_po2'),
+            bias_quantizer=quantized_bits(8, 2, symmetric=1, alpha='auto_po2')
         )
         self.cls = QConv2D(
             nc, 1,
-            kernel_quantizer=quantized_bits(8, 3, symmetric=1, alpha=1),
-            bias_quantizer=quantized_bits(8, 3, symmetric=1, alpha=1)
+            kernel_quantizer=quantized_bits(8, 2, symmetric=1, alpha='auto_po2'),
+            bias_quantizer=quantized_bits(8, 2, symmetric=1, alpha='auto_po2')
         )
 
     def call(self, x, training=False):
         if training:
-            # Training path: simple concatenation for loss computation
             return tf.concat([self.box(x), self.cls(x)], axis=-1)
         else:
-            # Inference path with dynamic operations
-            # NOTE: This path has operations that are problematic for HLS4ml:
-            # - tf.range loops
-            # - Dynamic reshaping
-            # - tf.meshgrid
-            # For FPGA synthesis, use the static inference model instead
             b = tf.shape(x)[0]
-            
             box = self.box(x)
             cls = self.cls(x)
             
             box_flat = tf.reshape(box, [b, -1, 4 * self.ch])
             cls_flat = tf.reshape(cls, [b, -1, self.nc])
-            
             box_processed = tf.reshape(box_flat, [b, -1, 4, self.ch])
             
             box_dfl = []
@@ -198,37 +171,26 @@ class QHead(Model):
             ], axis=-1)
             
             boxes = boxes * self.stride
-            
-            # WARNING: Sigmoid is expensive on FPGA
             return tf.concat([boxes, tf.sigmoid(cls_flat)], axis=-1)
 
 class QYOLO(Model):
-    """Quantized YOLO model for HLS4ml synthesis
-    
-    This model uses QKeras quantization-aware training.
-    For FPGA deployment, export using the static inference path.
-    """
+    """Quantized YOLO model - Conservative 8-bit version"""
     def __init__(self, widths=None, depths=None, num_classes=20, img_size=(256, 256), dtype=tf.float32):
-        super().__init__(dtype=dtype)
+        super().__init__()
         self.dtype_ = dtype
         self.net = QDarkNet(widths, depths, dtype=dtype)
         self.head = QHead(num_classes, ch_in=self.net.out_channels, dtype=dtype)
         
-        # Convert img_size to (h, w, c) format
         if isinstance(img_size, int):
             img_size_with_channels = (img_size, img_size, 3)
         else:
             img_size_with_channels = (*img_size, 3)
 
-        # Build layers by running a dummy forward pass
         dummy = tf.zeros((1, *img_size_with_channels), dtype=self.dtype_)
         _ = self.head(self.net(dummy), training=True)
 
-        # Initialize strides
         self.stride = self.calculate_stride(img_size_with_channels)
         self.head.stride = self.stride
-        
-        # Initialize biases
         self.initialize_biases()
         
     def call(self, x, training=False):
@@ -249,34 +211,20 @@ class QYOLO(Model):
     
     def initialize_biases(self):
         s = self.stride[0].numpy()
-        # Box bias
         if hasattr(self.head.box, 'bias') and self.head.box.bias is not None:
             self.head.box.bias.assign(tf.ones_like(self.head.box.bias))
-        # Class bias
         if hasattr(self.head.cls, 'bias') and self.head.cls.bias is not None:
             b = self.head.cls.bias
             bias_value = tf.math.log(5 / self.head.nc / (640 / s) ** 2)
             b.assign(tf.ones_like(b) * tf.cast(bias_value, b.dtype))
 
 
-def yolo_v8_s_quantized(num_classes: int = 20, img_size=(256, 256), dtype=tf.float32):
+def yolo_v8_s_quantized_conservative(num_classes: int = 20, img_size=(256, 256), dtype=tf.float32):
     """
-    Quantized Small YOLO v8 model for HLS4ml FPGA synthesis
+    Conservative Quantized YOLO v8 - Uniform 8-bit
     
-    Uses QKeras quantization-aware training with:
-    - Uniform 8-bit quantization across all layers (stable training)
-    - Fixed alpha=1 (prevents scale divergence)
-    - Symmetric quantization (hardware-efficient)
-    - 3 integer bits for weights (range [-8, 8])
-    - 4 integer bits for activations (range [0, 16])
-    
-    Args:
-        num_classes: Number of classes to detect
-        img_size: Input image size, can be int (square) or tuple (h, w)
-        dtype: Data type for the model (default: tf.float32)
-    
-    Returns:
-        Quantized YOLO model ready for training or HLS4ml conversion
+    Uses uniform 8-bit quantization across all layers for better convergence.
+    Once this trains successfully, you can try more aggressive quantization.
     """
     widths = [3, 4, 8, 16, 64, 128]
     depths = [1, 1, 1, 1]

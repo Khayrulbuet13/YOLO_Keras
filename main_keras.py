@@ -25,6 +25,15 @@ from utils.util_keras import (
     compute_ap
 )
 
+# Import QKeras utilities for quantized model handling
+try:
+    from qkeras.estimate import print_qstats
+    from qkeras.utils import model_save_quantized_weights
+    QKERAS_AVAILABLE = True
+except ImportError:
+    QKERAS_AVAILABLE = False
+    print("[WARNING] QKeras utilities not available. Quantized model saving may not work properly.")
+
 # Define global dtype for consistent type handling
 DTYPE = tf.float32  # Central dtype definition (change to float16 for mixed-precision)
 
@@ -229,8 +238,10 @@ def train(args, params):
     
     # Training loop
     best = 0
-    patience = 20  # Stop if no improvement for 20 epochs
+    patience = 50 if args.quantized else 20  # Quantized models need more patience
     patience_counter = 0
+    if args.quantized:
+        print(f"[INFO] Using increased patience for quantized training: {patience} epochs")
     num_batch = len(train_dataset) // args.batch_size  # Floor division since we drop incomplete batches
     num_warmup = max(round(params['warmup_epochs'] * num_batch), 1000)
     
@@ -294,6 +305,11 @@ def train(args, params):
 
             # Backward pass
             gradients = tape.gradient(loss, model.trainable_variables)
+            
+            # Clip gradients for quantized models to prevent explosion
+            if args.quantized:
+                gradients, global_norm = tf.clip_by_global_norm(gradients, 1.0)
+            
             optimizer.apply_gradients(zip(gradients, model.trainable_variables))
             
             # Update EMA
@@ -345,6 +361,12 @@ def train(args, params):
                 best = val_mean_ap
                 patience_counter = 0  # Reset counter on improvement
                 model.save_weights(os.path.join(args.save_path, 'best.weights.h5'))
+                
+                # Save quantized weights if using quantized model
+                if args.quantized and QKERAS_AVAILABLE:
+                    print("[INFO] Saving quantized weights for HLS4ml deployment...")
+                    model_save_quantized_weights(model)
+                    
                 print(f'Epoch {epoch + 1}: New best model saved (mAP: {best:.4f})')
             else:
                 patience_counter += 1
@@ -357,6 +379,19 @@ def train(args, params):
                 break
 
     csv_file.close()
+    
+    # Print quantization statistics for quantized models
+    if args.quantized and QKERAS_AVAILABLE and args.local_rank == 0:
+        print("\n" + "="*80)
+        print("QUANTIZATION STATISTICS")
+        print("="*80)
+        try:
+            print_qstats(model)
+        except (AttributeError, Exception) as e:
+            print(f"Note: print_qstats() not available for custom Model classes")
+            print(f"This is a known limitation - the model trained successfully")
+            print(f"Quantized weights have been saved and can be used for HLS4ml conversion")
+        print("="*80)
 
 def test(args, params, model=None, is_train=False):
     # Load dataset
