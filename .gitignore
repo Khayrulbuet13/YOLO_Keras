@@ -10,6 +10,7 @@ __pycache__/
 *.pt
 *.pth
 training_log*.txt
+*.log
 *.cache
 
 # Results

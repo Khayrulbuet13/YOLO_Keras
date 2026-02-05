@@ -14,6 +14,7 @@ from tqdm import tqdm
 
 from nets.tinysimov35_keras import yolo_v8_s
 from nets.tinysimov35_keras_quantized import yolo_v8_s_quantized
+from nets.tinysimov35_keras_hls4ml import yolo_v8_s_functional, decode_predictions
 from utils.dataset_keras import Dataset
 from utils.util_keras import (
     generate_colors, 
@@ -65,8 +66,9 @@ class MultiGroupOptimizer:
             var_name = var.name.lower()
             if var_name.endswith('/bias:0'):
                 self.bias_params.add(var.name)
-            elif any(bn in var_name for bn in ['/batch_normalization', '/bn', '/batchnorm']):
+            elif any(bn in var_name for bn in ['/batch_normalization', '/bn', '/batchnorm', '_bn']):
                 # All BN variables (gamma, beta, moving_mean, moving_variance)
+                # Matches both subclassed (conv/batch_normalization/gamma) and functional (backbone_bn1/gamma)
                 self.bn_params.add(var.name)
             elif var_name.endswith('/kernel:0'):
                 self.weight_params.add(var.name)
@@ -123,10 +125,13 @@ def train(args, params):
     # Initialize with central dtype
     num_classes = len(params['names'].values())
     
-    # Use quantized model if specified
+    # Select model architecture
     if args.quantized:
         print("[INFO] Using quantized model (QKeras) for HLS4ml FPGA synthesis")
         model = yolo_v8_s_quantized(num_classes, img_size=args.img_size, dtype=DTYPE)
+    elif args.functional:
+        print("[INFO] Using functional API model for QKeras compatibility")
+        model = yolo_v8_s_functional(num_classes, img_size=args.img_size, dtype=DTYPE)
     else:
         model = yolo_v8_s(num_classes, img_size=args.img_size, dtype=DTYPE)  # Pass dtype to model
     
@@ -306,8 +311,8 @@ def train(args, params):
             # Backward pass
             gradients = tape.gradient(loss, model.trainable_variables)
             
-            # Clip gradients for quantized models to prevent explosion
-            if args.quantized:
+            # Clip gradients for quantized and functional models to prevent explosion
+            if args.quantized or args.functional:
                 gradients, global_norm = tf.clip_by_global_norm(gradients, 1.0)
             
             optimizer.apply_gradients(zip(gradients, model.trainable_variables))
@@ -327,6 +332,8 @@ def train(args, params):
                 # Create a temporary model with EMA weights
                 if args.quantized:
                     eval_model = yolo_v8_s_quantized(num_classes, img_size=args.img_size)
+                elif args.functional:
+                    eval_model = yolo_v8_s_functional(num_classes, img_size=args.img_size)
                 else:
                     eval_model = yolo_v8_s(num_classes, img_size=args.img_size)
                 # Directly apply EMA weights
@@ -436,6 +443,8 @@ def test(args, params, model=None, is_train=False):
         model_path = os.path.join(args.save_path, 'best.weights.h5')
         if args.quantized:
             model = yolo_v8_s_quantized(len(params['names']), img_size=args.img_size)
+        elif args.functional:
+            model = yolo_v8_s_functional(len(params['names']), img_size=args.img_size)
         else:
             model = yolo_v8_s(len(params['names']), img_size=args.img_size)
         model.load_weights(model_path)
@@ -451,6 +460,13 @@ def test(args, params, model=None, is_train=False):
 
     for samples, targets, shapes in tqdm(loader, desc='Evaluating'):
         outputs = model(samples, training=False)
+        
+        # Decode predictions if using functional model (outputs raw features)
+        # Functional model outputs (B, H, W, 65) vs subclassed outputs (B, HW, 5)
+        if len(outputs.shape) == 4:
+            # Functional model: decode raw predictions
+            outputs = decode_predictions(outputs, model.stride, model.nc, model.dfl_ch, dtype=DTYPE)
+        
         detections = non_max_suppression(outputs, 0.25, 0.45)
         
         # Scale GT coordinates from normalized to pixel space (matching PyTorch line 416)
@@ -658,6 +674,7 @@ def main():
     parser.add_argument('--train', action='store_true')
     parser.add_argument('--test', action='store_true')
     parser.add_argument('--quantized', action='store_true', help='Use QKeras quantized model for HLS4ml FPGA synthesis')
+    parser.add_argument('--functional', action='store_true', help='Use Keras Functional API model (QKeras compatible)')
     parser.add_argument('--yaml_file', type=str, default='utils/args_bionano.yaml')
     parser.add_argument('--save-path', type=str, default='./results/rect_256x128_cleaned')
     parser.add_argument('--dataset-dir', type=str, default='./Dataset/bionano_cellv2')

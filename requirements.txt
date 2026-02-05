@@ -1,4 +1,4 @@
-tensorflow>=2.13.0
+tensorflow==2.15.0
 numpy
 opencv-python
 matplotlib
@@ -9,5 +9,4 @@ PyYAML
 tqdm
 qkeras
 hls4ml
-tf-keras
-tensorflow-model-optimization
+tensorflow-model-optimization<0.8.0
