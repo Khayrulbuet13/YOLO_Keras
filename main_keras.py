@@ -13,8 +13,8 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 
 from nets.tinysimov35_keras import yolo_v8_s
-from nets.tinysimov35_keras_quantized import yolo_v8_s_quantized
-from nets.tinysimov35_keras_hls4ml import yolo_v8_s_functional, decode_predictions
+from nets.tinysimov35_keras_quantized_functional import yolo_v8_s_quantized_functional
+from nets.tinysimov35_keras_functional import yolo_v8_s_functional, decode_predictions
 from utils.dataset_keras import Dataset
 from utils.util_keras import (
     generate_colors, 
@@ -128,7 +128,38 @@ def train(args, params):
     # Select model architecture
     if args.quantized:
         print("[INFO] Using quantized model (QKeras) for HLS4ml FPGA synthesis")
-        model = yolo_v8_s_quantized(num_classes, img_size=args.img_size, dtype=DTYPE)
+        model = yolo_v8_s_quantized_functional(num_classes, img_size=args.img_size, dtype=DTYPE)
+        
+        # Transfer weights from float32 model if available
+        if args.pretrained_weights:
+            print(f"[INFO] Loading pre-trained weights from: {args.pretrained_weights}")
+            float_model = yolo_v8_s_functional(num_classes, img_size=args.img_size, dtype=DTYPE)
+            float_model.load_weights(args.pretrained_weights)
+            
+            print("[INFO] Transferring weights from float32 to quantized model...")
+            float_layer_dict = {layer.name: layer for layer in float_model.layers}
+            transferred = 0
+            skipped = 0
+            
+            for qlayer in model.layers:
+                # Map quantized layer names to float32 layer names
+                # backbone_qconv1 -> backbone_conv1, etc.
+                float_name = qlayer.name.replace('qconv', 'conv').replace('qrelu', 'relu')
+                
+                if float_name in float_layer_dict:
+                    flayer = float_layer_dict[float_name]
+                    try:
+                        # Transfer weights if layer has them
+                        if len(flayer.get_weights()) > 0:
+                            qlayer.set_weights(flayer.get_weights())
+                            print(f"  ✓ {flayer.name} -> {qlayer.name}")
+                            transferred += 1
+                    except Exception as e:
+                        print(f"  ⚠ Failed {flayer.name} -> {qlayer.name}: {e}")
+                        skipped += 1
+            
+            print(f"[INFO] Weight transfer complete: {transferred} layers transferred, {skipped} skipped")
+            del float_model  # Free memory
     elif args.functional:
         print("[INFO] Using functional API model for QKeras compatibility")
         model = yolo_v8_s_functional(num_classes, img_size=args.img_size, dtype=DTYPE)
@@ -331,7 +362,7 @@ def train(args, params):
             if ema:
                 # Create a temporary model with EMA weights
                 if args.quantized:
-                    eval_model = yolo_v8_s_quantized(num_classes, img_size=args.img_size)
+                    eval_model = yolo_v8_s_quantized_functional(num_classes, img_size=args.img_size)
                 elif args.functional:
                     eval_model = yolo_v8_s_functional(num_classes, img_size=args.img_size)
                 else:
@@ -442,7 +473,7 @@ def test(args, params, model=None, is_train=False):
     if model is None:
         model_path = os.path.join(args.save_path, 'best.weights.h5')
         if args.quantized:
-            model = yolo_v8_s_quantized(len(params['names']), img_size=args.img_size)
+            model = yolo_v8_s_quantized_functional(len(params['names']), img_size=args.img_size)
         elif args.functional:
             model = yolo_v8_s_functional(len(params['names']), img_size=args.img_size)
         else:
@@ -675,6 +706,7 @@ def main():
     parser.add_argument('--test', action='store_true')
     parser.add_argument('--quantized', action='store_true', help='Use QKeras quantized model for HLS4ml FPGA synthesis')
     parser.add_argument('--functional', action='store_true', help='Use Keras Functional API model (QKeras compatible)')
+    parser.add_argument('--pretrained-weights', type=str, default=None, help='Path to pre-trained float32 weights for quantized model initialization (e.g., best_float32.h5)')
     parser.add_argument('--yaml_file', type=str, default='utils/args_bionano.yaml')
     parser.add_argument('--save-path', type=str, default='./results/rect_256x128_cleaned')
     parser.add_argument('--dataset-dir', type=str, default='./Dataset/bionano_cellv2')
