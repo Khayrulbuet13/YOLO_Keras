@@ -398,17 +398,28 @@ def train(args, params):
             if val_mean_ap > best:
                 best = val_mean_ap
                 patience_counter = 0  # Reset counter on improvement
-                model.save_weights(os.path.join(args.save_path, 'best.weights.h5'))
+                
+                # Save EMA weights if available (better performance), otherwise raw weights
+                if ema:
+                    # Save EMA weights by applying them to a temporary model
+                    save_model = model if not ema else eval_model
+                    save_model.save_weights(os.path.join(args.save_path, 'best.weights.h5'))
+                    print(f'Epoch {epoch + 1}: New best model saved with EMA weights (mAP: {best:.4f})')
+                else:
+                    model.save_weights(os.path.join(args.save_path, 'best.weights.h5'))
+                    print(f'Epoch {epoch + 1}: New best model saved (mAP: {best:.4f})')
                 
                 # Save quantized weights if using quantized model
                 if args.quantized and QKERAS_AVAILABLE:
                     print("[INFO] Saving quantized weights for HLS4ml deployment...")
-                    model_save_quantized_weights(model)
-                    
-                print(f'Epoch {epoch + 1}: New best model saved (mAP: {best:.4f})')
+                    if ema:
+                        model_save_quantized_weights(eval_model)
+                    else:
+                        model_save_quantized_weights(model)
             else:
                 patience_counter += 1
             
+            # Save last weights (always raw training weights for resuming)
             model.save_weights(os.path.join(args.save_path, 'last.weights.h5'))
             
             # Early stopping check

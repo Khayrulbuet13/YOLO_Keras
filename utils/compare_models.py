@@ -317,12 +317,15 @@ def create_comparison_report(float32_results, quantized_results, float32_memory,
         f.write("\n")
         
         # Inference Time
-        f.write("INFERENCE PERFORMANCE\n")
+        f.write("INFERENCE PERFORMANCE (CPU/Python)\n")
         f.write("-"*80 + "\n")
         f.write(f"Float32 Inference Time:   {float32_results['avg_inference_time_ms']:.2f} ms/batch\n")
         f.write(f"Quantized Inference Time: {quantized_results['avg_inference_time_ms']:.2f} ms/batch\n")
         speedup = float32_results['avg_inference_time_ms'] / quantized_results['avg_inference_time_ms']
         f.write(f"Speedup:                  {speedup:.2f}x\n\n")
+        f.write("NOTE: Quantized model is slower on CPU because QKeras simulates quantization\n")
+        f.write("      in float32. Real speedup occurs after HLS4ml synthesis to FPGA hardware,\n")
+        f.write("      where actual INT8 operations provide 2-4x speedup and lower power.\n\n")
         
         # Summary
         f.write("SUMMARY\n")
@@ -381,13 +384,30 @@ def create_comparison_plots(float32_results, quantized_results, save_path):
         else:
             losses.append(0)
     
-    colors = ['green' if l >= 0 else 'red' for l in losses]
-    ax2.bar(metrics, losses, color=colors, alpha=0.7)
-    ax2.set_ylabel('Accuracy Change (%)', fontweight='bold')
-    ax2.set_title('Quantization Impact on Accuracy', fontweight='bold')
-    ax2.set_xticklabels(metrics, rotation=45, ha='right')
-    ax2.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
-    ax2.grid(axis='y', alpha=0.3)
+    colors = ['#2ecc71' if l >= 0 else '#e74c3c' for l in losses]
+    bars = ax2.bar(metrics, losses, color=colors, alpha=0.7, edgecolor='black', linewidth=1)
+    ax2.set_ylabel('Accuracy Change (%)', fontweight='bold', fontsize=11)
+    ax2.set_title('Quantization Impact on Accuracy', fontweight='bold', fontsize=12)
+    ax2.set_xticklabels(metrics, rotation=45, ha='right', fontsize=9)
+    ax2.axhline(y=0, color='black', linestyle='-', linewidth=1.5)
+    ax2.grid(axis='y', alpha=0.3, linestyle='--')
+    
+    # Add value labels on bars
+    for bar, loss in zip(bars, losses):
+        height = bar.get_height()
+        label_y = height + (1 if height >= 0 else -3)
+        ax2.text(bar.get_x() + bar.get_width()/2., label_y,
+                f'{loss:.1f}%',
+                ha='center', va='bottom' if height >= 0 else 'top',
+                fontweight='bold', fontsize=9)
+    
+    # Add legend
+    from matplotlib.patches import Patch
+    legend_elements = [
+        Patch(facecolor='#2ecc71', alpha=0.7, label='Improvement'),
+        Patch(facecolor='#e74c3c', alpha=0.7, label='Degradation')
+    ]
+    ax2.legend(handles=legend_elements, loc='upper right', fontsize=9)
     
     # Plot 3: Inference Time Comparison
     ax3 = axes[1, 0]
