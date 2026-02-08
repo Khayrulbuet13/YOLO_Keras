@@ -36,3 +36,6 @@ Thumbs.db
 
 # Other files
 qkeras
+/results/**
+
+
