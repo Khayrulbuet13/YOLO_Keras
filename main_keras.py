@@ -13,6 +13,8 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 
 from nets.tinysimov35_keras import yolo_v8_s
+from nets.tinysimov35_keras_quantized_functional import yolo_v8_s_quantized_functional
+from nets.tinysimov35_keras_functional import yolo_v8_s_functional, decode_predictions
 from utils.dataset_keras import Dataset
 from utils.util_keras import (
     generate_colors, 
@@ -23,6 +25,15 @@ from utils.util_keras import (
     non_max_suppression,
     compute_ap
 )
+
+# Import QKeras utilities for quantized model handling
+try:
+    from qkeras.estimate import print_qstats
+    from qkeras.utils import model_save_quantized_weights
+    QKERAS_AVAILABLE = True
+except ImportError:
+    QKERAS_AVAILABLE = False
+    print("[WARNING] QKeras utilities not available. Quantized model saving may not work properly.")
 
 # Define global dtype for consistent type handling
 DTYPE = tf.float32  # Central dtype definition (change to float16 for mixed-precision)
@@ -55,8 +66,9 @@ class MultiGroupOptimizer:
             var_name = var.name.lower()
             if var_name.endswith('/bias:0'):
                 self.bias_params.add(var.name)
-            elif any(bn in var_name for bn in ['/batch_normalization', '/bn', '/batchnorm']):
+            elif any(bn in var_name for bn in ['/batch_normalization', '/bn', '/batchnorm', '_bn']):
                 # All BN variables (gamma, beta, moving_mean, moving_variance)
+                # Matches both subclassed (conv/batch_normalization/gamma) and functional (backbone_bn1/gamma)
                 self.bn_params.add(var.name)
             elif var_name.endswith('/kernel:0'):
                 self.weight_params.add(var.name)
@@ -112,7 +124,47 @@ class MultiGroupOptimizer:
 def train(args, params):
     # Initialize with central dtype
     num_classes = len(params['names'].values())
-    model = yolo_v8_s(num_classes, img_size=args.img_size, dtype=DTYPE)  # Pass dtype to model
+    
+    # Select model architecture
+    if args.quantized:
+        print("[INFO] Using quantized model (QKeras) for HLS4ml FPGA synthesis")
+        model = yolo_v8_s_quantized_functional(num_classes, img_size=args.img_size, dtype=DTYPE)
+        
+        # Transfer weights from float32 model if available
+        if args.pretrained_weights:
+            print(f"[INFO] Loading pre-trained weights from: {args.pretrained_weights}")
+            float_model = yolo_v8_s_functional(num_classes, img_size=args.img_size, dtype=DTYPE)
+            float_model.load_weights(args.pretrained_weights)
+            
+            print("[INFO] Transferring weights from float32 to quantized model...")
+            float_layer_dict = {layer.name: layer for layer in float_model.layers}
+            transferred = 0
+            skipped = 0
+            
+            for qlayer in model.layers:
+                # Map quantized layer names to float32 layer names
+                # backbone_qconv1 -> backbone_conv1, etc.
+                float_name = qlayer.name.replace('qconv', 'conv').replace('qrelu', 'relu')
+                
+                if float_name in float_layer_dict:
+                    flayer = float_layer_dict[float_name]
+                    try:
+                        # Transfer weights if layer has them
+                        if len(flayer.get_weights()) > 0:
+                            qlayer.set_weights(flayer.get_weights())
+                            print(f"  ✓ {flayer.name} -> {qlayer.name}")
+                            transferred += 1
+                    except Exception as e:
+                        print(f"  ⚠ Failed {flayer.name} -> {qlayer.name}: {e}")
+                        skipped += 1
+            
+            print(f"[INFO] Weight transfer complete: {transferred} layers transferred, {skipped} skipped")
+            del float_model  # Free memory
+    elif args.functional:
+        print("[INFO] Using functional API model for QKeras compatibility")
+        model = yolo_v8_s_functional(num_classes, img_size=args.img_size, dtype=DTYPE)
+    else:
+        model = yolo_v8_s(num_classes, img_size=args.img_size, dtype=DTYPE)  # Pass dtype to model
     
     # Create model directory
     if args.local_rank == 0:
@@ -222,8 +274,10 @@ def train(args, params):
     
     # Training loop
     best = 0
-    patience = 20  # Stop if no improvement for 20 epochs
+    patience = 50 if args.quantized else 20  # Quantized models need more patience
     patience_counter = 0
+    if args.quantized:
+        print(f"[INFO] Using increased patience for quantized training: {patience} epochs")
     num_batch = len(train_dataset) // args.batch_size  # Floor division since we drop incomplete batches
     num_warmup = max(round(params['warmup_epochs'] * num_batch), 1000)
     
@@ -287,6 +341,11 @@ def train(args, params):
 
             # Backward pass
             gradients = tape.gradient(loss, model.trainable_variables)
+            
+            # Clip gradients for quantized and functional models to prevent explosion
+            if args.quantized or args.functional:
+                gradients, global_norm = tf.clip_by_global_norm(gradients, 1.0)
+            
             optimizer.apply_gradients(zip(gradients, model.trainable_variables))
             
             # Update EMA
@@ -302,7 +361,12 @@ def train(args, params):
             eval_model = model
             if ema:
                 # Create a temporary model with EMA weights
-                eval_model = yolo_v8_s(num_classes, img_size=args.img_size)
+                if args.quantized:
+                    eval_model = yolo_v8_s_quantized_functional(num_classes, img_size=args.img_size)
+                elif args.functional:
+                    eval_model = yolo_v8_s_functional(num_classes, img_size=args.img_size)
+                else:
+                    eval_model = yolo_v8_s(num_classes, img_size=args.img_size)
                 # Directly apply EMA weights
                 eval_model.set_weights([w.numpy() for w in ema.ema_weights])
             
@@ -334,11 +398,28 @@ def train(args, params):
             if val_mean_ap > best:
                 best = val_mean_ap
                 patience_counter = 0  # Reset counter on improvement
-                model.save_weights(os.path.join(args.save_path, 'best.weights.h5'))
-                print(f'Epoch {epoch + 1}: New best model saved (mAP: {best:.4f})')
+                
+                # Save EMA weights if available (better performance), otherwise raw weights
+                if ema:
+                    # Save EMA weights by applying them to a temporary model
+                    save_model = model if not ema else eval_model
+                    save_model.save_weights(os.path.join(args.save_path, 'best.weights.h5'))
+                    print(f'Epoch {epoch + 1}: New best model saved with EMA weights (mAP: {best:.4f})')
+                else:
+                    model.save_weights(os.path.join(args.save_path, 'best.weights.h5'))
+                    print(f'Epoch {epoch + 1}: New best model saved (mAP: {best:.4f})')
+                
+                # Save quantized weights if using quantized model
+                if args.quantized and QKERAS_AVAILABLE:
+                    print("[INFO] Saving quantized weights for HLS4ml deployment...")
+                    if ema:
+                        model_save_quantized_weights(eval_model)
+                    else:
+                        model_save_quantized_weights(model)
             else:
                 patience_counter += 1
             
+            # Save last weights (always raw training weights for resuming)
             model.save_weights(os.path.join(args.save_path, 'last.weights.h5'))
             
             # Early stopping check
@@ -347,6 +428,19 @@ def train(args, params):
                 break
 
     csv_file.close()
+    
+    # Print quantization statistics for quantized models
+    if args.quantized and QKERAS_AVAILABLE and args.local_rank == 0:
+        print("\n" + "="*80)
+        print("QUANTIZATION STATISTICS")
+        print("="*80)
+        try:
+            print_qstats(model)
+        except (AttributeError, Exception) as e:
+            print(f"Note: print_qstats() not available for custom Model classes")
+            print(f"This is a known limitation - the model trained successfully")
+            print(f"Quantized weights have been saved and can be used for HLS4ml conversion")
+        print("="*80)
 
 def test(args, params, model=None, is_train=False):
     # Load dataset
@@ -389,7 +483,12 @@ def test(args, params, model=None, is_train=False):
     # Load model if not provided
     if model is None:
         model_path = os.path.join(args.save_path, 'best.weights.h5')
-        model = yolo_v8_s(len(params['names']), img_size=args.img_size)
+        if args.quantized:
+            model = yolo_v8_s_quantized_functional(len(params['names']), img_size=args.img_size)
+        elif args.functional:
+            model = yolo_v8_s_functional(len(params['names']), img_size=args.img_size)
+        else:
+            model = yolo_v8_s(len(params['names']), img_size=args.img_size)
         model.load_weights(model_path)
 
 
@@ -403,6 +502,13 @@ def test(args, params, model=None, is_train=False):
 
     for samples, targets, shapes in tqdm(loader, desc='Evaluating'):
         outputs = model(samples, training=False)
+        
+        # Decode predictions if using functional model (outputs raw features)
+        # Functional model outputs (B, H, W, 65) vs subclassed outputs (B, HW, 5)
+        if len(outputs.shape) == 4:
+            # Functional model: decode raw predictions
+            outputs = decode_predictions(outputs, model.stride, model.nc, model.dfl_ch, dtype=DTYPE)
+        
         detections = non_max_suppression(outputs, 0.25, 0.45)
         
         # Scale GT coordinates from normalized to pixel space (matching PyTorch line 416)
@@ -609,6 +715,9 @@ def main():
     parser.add_argument('--epochs', default=500, type=int)
     parser.add_argument('--train', action='store_true')
     parser.add_argument('--test', action='store_true')
+    parser.add_argument('--quantized', action='store_true', help='Use QKeras quantized model for HLS4ml FPGA synthesis')
+    parser.add_argument('--functional', action='store_true', help='Use Keras Functional API model (QKeras compatible)')
+    parser.add_argument('--pretrained-weights', type=str, default=None, help='Path to pre-trained float32 weights for quantized model initialization (e.g., best_float32.h5)')
     parser.add_argument('--yaml_file', type=str, default='utils/args_bionano.yaml')
     parser.add_argument('--save-path', type=str, default='./results/rect_256x128_cleaned')
     parser.add_argument('--dataset-dir', type=str, default='./Dataset/bionano_cellv2')

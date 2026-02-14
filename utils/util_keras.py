@@ -486,8 +486,17 @@ class ComputeLoss(Layer):
         self.dtype_ = dtype  # Store as different attribute name
         self.params = params
         
-        # Extract parameters from model head
-        m = model.layers[-1] if hasattr(model, 'layers') else model.head
+        # Extract parameters from model - support both subclassed and functional models
+        # Functional models store metadata directly on the model object
+        # Subclassed models store it in model.head
+        if hasattr(model, 'dfl_ch'):
+            # Functional model: metadata stored directly on model
+            m = model
+            self.dfl_ch = m.dfl_ch
+        else:
+            # Subclassed model: metadata in model.head
+            m = model.layers[-1] if hasattr(model, 'layers') else model.head
+            self.dfl_ch = m.dfl.ch
         
         self.stride = m.stride
         # Convert TensorFlow tensor to numpy array if needed
@@ -510,7 +519,6 @@ class ComputeLoss(Layer):
         
         self.nc = m.nc  # number of classes
         self.no = m.no
-        self.dfl_ch = m.dfl.ch
         
         # Task-aligned assigner config
         self.top_k = 10

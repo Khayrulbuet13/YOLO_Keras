@@ -1,4 +1,4 @@
-tensorflow>=2.13.0
+tensorflow==2.15.0
 numpy
 opencv-python
 matplotlib
@@ -7,3 +7,6 @@ seaborn
 comet-ml
 PyYAML
 tqdm
+qkeras
+hls4ml
+tensorflow-model-optimization<0.8.0
