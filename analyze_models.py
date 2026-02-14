@@ -77,7 +77,7 @@ comparison_metrics = ['val_mAP@50', 'val_mAP', 'val_Precision', 'val_Recall', 'v
 
 print("\n1. BEST EPOCH COMPARISON:")
 print("-"*80)
-print(f"{'Metric':<20} {'KD Quantized':<15} {'From Pretrained':<15} {'Difference':<15} {'Winner':<10}")
+print(f"{'Metric':<20} {'KD Default':<15} {'From Pretrained':<15} {'Difference':<15} {'Winner':<10}")
 print("-"*80)
 
 winner_count = {'kd': 0, 'pretrained': 0}
@@ -94,12 +94,12 @@ for metric in comparison_metrics:
     print(f"{metric:<20} {kd_val:<15.4f} {pre_val:<15.4f} {diff:+.4f} ({diff/kd_val*100:+.1f}%)    {winner:<10}")
 
 print()
-print(f"Winner by best metrics: {'From Pretrained' if winner_count['pretrained'] > winner_count['kd'] else 'KD Quantized'}")
+print(f"Winner by best metrics: {'From Pretrained' if winner_count['pretrained'] > winner_count['kd'] else 'KD Default'}")
 print(f"  (Pretrained: {winner_count['pretrained']}, KD: {winner_count['kd']})")
 
 print("\n2. FINAL EPOCH COMPARISON:")
 print("-"*80)
-print(f"{'Metric':<20} {'KD Quantized':<15} {'From Pretrained':<15} {'Difference':<15} {'Winner':<10}")
+print(f"{'Metric':<20} {'KD Default':<15} {'From Pretrained':<15} {'Difference':<15} {'Winner':<10}")
 print("-"*80)
 
 winner_count = {'kd': 0, 'pretrained': 0}
@@ -116,12 +116,12 @@ for metric in comparison_metrics:
     print(f"{metric:<20} {kd_val:<15.4f} {pre_val:<15.4f} {diff:+.4f} ({diff/kd_val*100:+.1f}%)    {winner:<10}")
 
 print()
-print(f"Winner by final metrics: {'From Pretrained' if winner_count['pretrained'] > winner_count['kd'] else 'KD Quantized'}")
+print(f"Winner by final metrics: {'From Pretrained' if winner_count['pretrained'] > winner_count['kd'] else 'KD Default'}")
 print(f"  (Pretrained: {winner_count['pretrained']}, KD: {winner_count['kd']})")
 
 print("\n3. STABILITY (Last 10 Epochs Average):")
 print("-"*80)
-print(f"{'Metric':<20} {'KD Quantized':<20} {'From Pretrained':<20} {'Winner':<10}")
+print(f"{'Metric':<20} {'KD Default':<20} {'From Pretrained':<20} {'Winner':<10}")
 print("-"*80)
 
 winner_count = {'kd': 0, 'pretrained': 0}
@@ -142,7 +142,7 @@ for metric in comparison_metrics:
     print(f"{metric:<20} {kd_val:.4f} ± {kd_std:.4f}    {pre_val:.4f} ± {pre_std:.4f}    {winner:<10}")
 
 print()
-print(f"Winner by stability: {'From Pretrained' if winner_count['pretrained'] > winner_count['kd'] else 'KD Quantized'}")
+print(f"Winner by stability: {'From Pretrained' if winner_count['pretrained'] > winner_count['kd'] else 'KD Default'}")
 print(f"  (Pretrained: {winner_count['pretrained']}, KD: {winner_count['kd']})")
 
 # Training efficiency
@@ -154,12 +154,15 @@ kd_best_epoch = kd_data['val_mAP@50'].idxmax() + 1
 pre_best_epoch = pretrained_data['val_mAP@50'].idxmax() + 1
 
 print(f"Epochs to reach best mAP@50:")
-print(f"  KD Quantized:       {kd_best_epoch} epochs (best: {kd_data['val_mAP@50'].max():.4f})")
+print(f"  KD Default:         {kd_best_epoch} epochs (best: {kd_data['val_mAP@50'].max():.4f})")
 print(f"  From Pretrained:    {pre_best_epoch} epochs (best: {pretrained_data['val_mAP@50'].max():.4f})")
 print(f"\nTotal training epochs:")
-print(f"  KD Quantized:       {kd_epochs} epochs")
+print(f"  KD Default:         {kd_epochs} epochs")
 print(f"  From Pretrained:    {pre_epochs} epochs")
-print(f"\nEfficiency: KD Quantized is {(1 - kd_epochs/pre_epochs)*100:.1f}% faster in training time")
+if kd_epochs != pre_epochs:
+    print(f"\nEfficiency: KD is {abs(1 - kd_epochs/pre_epochs)*100:.1f}% {'faster' if kd_epochs < pre_epochs else 'slower'} in training time")
+else:
+    print(f"\nBoth trained for the same number of epochs")
 
 # Create visualization
 fig, axes = plt.subplots(2, 3, figsize=(18, 12))
@@ -189,28 +192,27 @@ for idx, (metric, title) in enumerate(metrics_to_plot):
 ax = axes[1, 2]
 ax.axis('off')
 
+better_model = 'From Pretrained' if pretrained_data['val_mAP@50'].max() > kd_data['val_mAP@50'].max() else 'KD Quantized'
 summary_text = f"""
 FINAL VERDICT
 {'='*40}
 
-Best Overall Model: From Pretrained
-(Superior in 4/5 key metrics)
+Best Overall Model: {better_model}
 
 Key Findings:
 • val_mAP@50: {pretrained_data['val_mAP@50'].max():.4f} (Pretrained) 
               vs {kd_data['val_mAP@50'].max():.4f} (KD)
 
-• Training Time: KD is {(1 - kd_epochs/pre_epochs)*100:.1f}% faster
-  ({kd_epochs} vs {pre_epochs} epochs)
+• Training Epochs: {kd_epochs} vs {pre_epochs}
 
-• Stability: Pretrained more stable
-  (lower std in last 10 epochs)
+• Final val_mAP@50:
+  KD:         {kd_data['val_mAP@50'].iloc[-1]:.4f}
+  Pretrained: {pretrained_data['val_mAP@50'].iloc[-1]:.4f}
 
 Recommendation:
-Use 'From Pretrained' for deployment
-- Higher accuracy across all metrics
-- More stable convergence
-- Perfect precision & recall (final)
+Use '{better_model}' for deployment
+- Better validation performance
+- Check stability metrics below
 """
 
 ax.text(0.1, 0.5, summary_text, fontsize=11, family='monospace',

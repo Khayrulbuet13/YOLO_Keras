@@ -21,12 +21,14 @@ python main_keras.py --train --quantized --yaml_file utils/args_bionano.yaml --s
 # KNOWLEDGE DISTILLATION TRAINING EXAMPLES
 # ============================================================================
 
-# Example 1: KD training with default hyperparameters (recommended starting point)
+# Example 1: KD training with LymphoML-aligned hyperparameters (recommended starting point)
 # Trains quantized student using knowledge from full-precision teacher
 # - Teacher: Pre-trained float32 functional model
 # - Student: Quantized model initialized from teacher weights (warmstart)
-# - KD alpha: 0.5 (balanced task + KD loss)
-# - Temperature: 4.0 (moderate softening)
+# - KD alpha: 1.0 (pure KD loss, aligned with LymphoML Student2)
+# - Temperature: 1.0 (no softening, aligned with LymphoML Student2)
+# - Learning rate: 0.001 (constant, from args_bionano_kd.yaml)
+# - Weight decay: 0.0001 (from args_bionano_kd.yaml)
 python main_kd.py \
     --train \
     --input-size 256 \
@@ -38,6 +40,6 @@ python main_kd.py \
     --kd-temperature 1.0 \
     --kd-box-weight 1.0 \
     --kd-cls-weight 1.0 \
-    --yaml_file utils/args_bionano.yaml \
-    --save-path ./results/kd_quantized_default \
+    --yaml_file utils/args_bionano_kd.yaml \
+    --save-path ./results/kd_quantized_lymphoml \
     --dataset-dir ./Dataset/bionano_cellv2
