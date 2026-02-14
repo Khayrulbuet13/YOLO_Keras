@@ -10,6 +10,7 @@ __pycache__/
 *.pt
 *.pth
 training_log*.txt
+*.log
 *.cache
 
 # Results
@@ -29,3 +30,12 @@ Thumbs.db
 
 # Jupyter
 .ipynb_checkpoints/
+
+# Ignore everything in Dataset folder
+/Dataset/**
+
+# Other files
+qkeras
+/results/**
+
+
