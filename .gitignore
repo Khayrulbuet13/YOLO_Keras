@@ -40,4 +40,7 @@ qkeras
 /LymphoML/**
 LymphoML/
 
+# Backup folder
+.bac/
+
 
