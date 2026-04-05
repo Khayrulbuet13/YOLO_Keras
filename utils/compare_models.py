@@ -193,14 +193,18 @@ def evaluate_model(model, dataset, params, img_size, model_name="Model"):
                 # Calculate IoU
                 for j in range(len(iou_v)):
                     iou_threshold = iou_v[j]
+                    matched_gt = set()  # track GT boxes already matched at this IoU threshold
                     
                     for det_idx in range(det_clone.shape[0]):
                         det_box = det_clone[det_idx, :4]
                         det_class = det_clone[det_idx, 5]
                         
                         best_iou = 0
+                        best_gt_idx = -1
                         
                         for gt_idx in range(len(t_tensor)):
+                            if gt_idx in matched_gt:
+                                continue
                             gt_box = t_tensor[gt_idx, 1:5]
                             gt_class = t_tensor[gt_idx, 0]
                             
@@ -219,9 +223,11 @@ def evaluate_model(model, dataset, params, img_size, model_name="Model"):
                                     
                                     if iou > best_iou:
                                         best_iou = iou
+                                        best_gt_idx = gt_idx
                         
-                        if best_iou >= iou_threshold:
+                        if best_iou >= iou_threshold and best_gt_idx >= 0:
                             correct[det_idx, j] = True
+                            matched_gt.add(best_gt_idx)  # prevent re-matching this GT
                 
                 conf = det_clone[:, 4]
                 pred_cls = det_clone[:, 5]

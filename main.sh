@@ -16,3 +16,7 @@ echo "Training completed. Check training_log_keras.txt for results."
 
 # Functional API
 python main_keras.py --train --quantized --yaml_file utils/args_bionano.yaml --save-path ./results/quantized_integration_from_pretrained --input-size 128x256 --pretrained-weights results/rect_256x128_functional/best.weights.h5
+
+
+# Yolo26 style end-to-end model
+python3 main_keras.py --train --e2e   --yaml_file utils/args_bionano_e2e.yaml --input-size 128x256  --save-path ./results/e2e_256x128   --dataset-dir ./Dataset/bionano_cellv2

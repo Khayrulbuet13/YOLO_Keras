@@ -85,9 +85,10 @@ def build_yolo_functional(num_classes=1, img_size=(256, 256), dtype=tf.float32):
     model.dfl_ch = dfl_ch
     model.no = num_classes + 4 * dfl_ch
     
-    # Calculate stride by running dummy forward pass
-    dummy = tf.zeros((1, h, w, 3), dtype=dtype)
-    features = model(dummy, training=False)
+    # Calculate stride by running dummy forward pass -- force CPU to avoid CuDNN version mismatches
+    with tf.device('/CPU:0'):
+        dummy = tf.zeros((1, h, w, 3), dtype=dtype)
+        features = model(dummy, training=False)
     feature_h, feature_w = features.shape[1], features.shape[2]
     stride_h = h / feature_h
     stride_w = w / feature_w
@@ -97,19 +98,21 @@ def build_yolo_functional(num_classes=1, img_size=(256, 256), dtype=tf.float32):
     
     model.stride = tf.constant([(stride_h + stride_w) / 2], dtype=dtype)
     
-    # Initialize biases (matching the subclassed model's initialize_biases)
-    s = model.stride[0].numpy()
-    
-    # Box bias: set to 1.0
+    # Initialize biases using numpy/math (avoid GPU dispatch for scalar ops)
+    import math as _math
+    import numpy as _np
+    s = float(model.stride[0].numpy())
+
     box_layer = model.get_layer('box_conv')
     if box_layer.bias is not None:
         box_layer.bias.assign(tf.ones_like(box_layer.bias))
-    
-    # Class bias: log(5 / nc / (640 / s)^2)
+
     cls_layer = model.get_layer('cls_conv')
     if cls_layer.bias is not None:
-        bias_value = tf.math.log(5 / num_classes / (640 / s) ** 2)
-        cls_layer.bias.assign(tf.ones_like(cls_layer.bias) * tf.cast(bias_value, cls_layer.bias.dtype))
+        bias_value = float(_math.log(5 / num_classes / (640 / s) ** 2))
+        cls_layer.bias.assign(
+            tf.constant(_np.full(cls_layer.bias.shape, bias_value), dtype=cls_layer.bias.dtype)
+        )
     
     return model
 

@@ -936,3 +936,607 @@ class ComputeLoss(Layer):
         ciou = iou - (rho2 / c2 + v * alpha)
 
         return ciou  # do NOT squeeze – shape identical to PyTorch
+
+
+# ---------------------------------------------------------------------------
+# YOLO26-style losses: no DFL, end-to-end (NMS-free)
+# ---------------------------------------------------------------------------
+
+class ComputeLossNoDFL(Layer):
+    """
+    Detection loss for YOLO26-style models (reg_max=1, no DFL).
+
+    Differences from ComputeLoss:
+    - Box head outputs 4 channels (direct LTRB), no softmax+matmul decode.
+    - DFL cross-entropy replaced with L1 on image-normalized LTRB distances.
+    - Accepts tal_topk / tal_topk2 for one-to-one assignment (topk2=1).
+    - imgsz must be passed to call() so the L1 term can be normalized.
+
+    Usage:
+        loss_fn = ComputeLossNoDFL(model, params, tal_topk=10)
+        loss_fn_o2o = ComputeLossNoDFL(model, params, tal_topk=7, tal_topk2=1)
+    """
+
+    def __init__(self, model, params, dtype=tf.float32,
+                 tal_topk=10, tal_topk2=None, **kwargs):
+        super().__init__(dtype=dtype, **kwargs)
+        self.dtype_ = dtype
+        self.params = params
+        self.tal_topk = tal_topk
+        self.tal_topk2 = tal_topk2  # None means same as tal_topk (standard assignment)
+
+        # Extract metadata from model (same pattern as ComputeLoss)
+        if hasattr(model, 'dfl_ch'):
+            m = model
+        else:
+            m = model.layers[-1] if hasattr(model, 'layers') else model.head
+
+        self.stride = m.stride
+        if hasattr(self.stride, 'numpy'):
+            stride_np = self.stride.numpy()
+            self.stride = [float(stride_np)] if stride_np.ndim == 0 else [float(s) for s in stride_np]
+        elif not isinstance(self.stride, (list, tuple)):
+            self.stride = [float(self.stride)]
+        else:
+            self.stride = [float(s) for s in self.stride]
+
+        self.nc = m.nc
+        # no = 4 + nc for NoDFL models (dfl_ch=1 by convention)
+        self.no = 4 + self.nc
+
+        self.alpha = 0.5
+        self.beta = 6.0
+        self.eps = 1e-9
+
+        self.bs = 1
+        self.num_max_boxes = 0
+
+    def call(self, outputs, targets, imgsz=None):
+        """
+        Compute loss.
+
+        Args:
+            outputs: raw model output (B, H, W, 4+nc) -- LTRB + class logits
+            targets: (N_total, 6) -- [batch_idx, cls, x, y, w, h] normalized
+            imgsz: (h, w) in pixels for LTRB normalization; inferred from outputs if None
+
+        Returns:
+            scalar total loss
+        """
+        outputs = tf.cast(outputs, self.dtype_)
+        targets = tf.cast(targets, self.dtype_)
+
+        if not isinstance(outputs, (list, tuple)):
+            outputs = [outputs]
+
+        # Convert to NCHW and flatten spatial dims
+        x = [tf.transpose(o, [0, 3, 1, 2]) for o in outputs]
+        output = tf.concat([tf.reshape(i, (i.shape[0], self.no, -1)) for i in x], axis=2)
+
+        pred_output, pred_scores = tf.split(output, [4, self.nc], axis=1)
+        pred_output = tf.transpose(pred_output, [0, 2, 1])   # (B, A, 4)
+        pred_scores = tf.transpose(pred_scores, [0, 2, 1])   # (B, A, nc)
+
+        # Image size for LTRB normalization
+        hw = tf.cast(tf.shape(x[0])[2:4], dtype=self.dtype_)  # (h, w) in feature map
+        if imgsz is None:
+            size = hw * self.stride[0]  # (h_img, w_img)
+        else:
+            size = tf.cast(imgsz, self.dtype_)
+
+        imgsz_h = size[0]
+        imgsz_w = size[1]
+
+        anchor_points, stride_tensor = make_anchors_tf(x, self.stride, 0.5)
+        anchor_points = cast_like(anchor_points, outputs[0])
+        stride_tensor = cast_like(stride_tensor, outputs[0])
+
+        # Process targets into (B, N, 5) tensors
+        if tf.shape(targets)[0] == 0:
+            gt = tf.zeros((pred_scores.shape[0], 0, 5), dtype=pred_scores.dtype)
+        else:
+            i = targets[:, 0]
+            _, _, counts = tf.unique_with_counts(i)
+            max_count = tf.reduce_max(counts)
+            gt = tf.zeros((pred_scores.shape[0], max_count, 5), dtype=pred_scores.dtype)
+            for j in range(pred_scores.shape[0]):
+                matches = tf.equal(i, j)
+                n = tf.reduce_sum(tf.cast(matches, tf.int32))
+                if n > 0:
+                    selected = tf.boolean_mask(targets, matches)[:, 1:]
+                    padded = tf.pad(selected, [[0, max_count - n], [0, 0]])
+                    padded = tf.expand_dims(padded, axis=0)
+                    gt = tf.tensor_scatter_nd_update(gt, [[j]], padded)
+
+            # Normalize WH to XYXY in pixel space
+            boxes = gt[..., 1:5] * tf.concat([size[1:2], size[0:1], size[1:2], size[0:1]], axis=0)
+            gt_boxes = wh2xy(boxes)
+            gt = tf.concat([gt[..., 0:1], gt_boxes], axis=-1)
+
+        gt_labels, gt_bboxes = tf.split(gt, [1, 4], axis=2)
+        mask_gt = tf.reduce_sum(gt_bboxes, axis=2, keepdims=True) > 0
+
+        # --- Direct LTRB decode (no softmax, no DFL projection) ---
+        a_tensor, b_tensor = tf.split(pred_output, 2, axis=-1)
+        pred_bboxes = tf.concat([anchor_points - a_tensor, anchor_points + b_tensor], axis=-1)
+
+        # Detach for assignment (stop gradient into assigner)
+        scores_det = tf.stop_gradient(tf.sigmoid(pred_scores))
+        bboxes_det = tf.stop_gradient(pred_bboxes * stride_tensor)
+
+        target_bboxes, target_scores, fg_mask = self.assign(
+            scores_det, bboxes_det, gt_labels, gt_bboxes, mask_gt,
+            anchor_points * stride_tensor
+        )
+        target_bboxes /= stride_tensor
+        target_scores_sum = tf.reduce_sum(target_scores)
+
+        # Classification loss (sigmoid BCE)
+        loss_cls = tf.reduce_sum(
+            tf.nn.sigmoid_cross_entropy_with_logits(labels=target_scores, logits=pred_scores)
+        ) / tf.maximum(target_scores_sum, 1)
+
+        loss_box = tf.zeros(1, dtype=tf.float32)
+        loss_l1 = tf.zeros(1, dtype=tf.float32)
+        fg_count = tf.reduce_sum(tf.cast(fg_mask, tf.float32))
+
+        if fg_count > 0:
+            weight = tf.boolean_mask(
+                tf.reduce_sum(target_scores, axis=-1), fg_mask
+            )[:, tf.newaxis]
+
+            # CIoU loss
+            iou = self.compute_iou(
+                tf.boolean_mask(pred_bboxes, fg_mask),
+                tf.boolean_mask(target_bboxes, fg_mask)
+            )
+            loss_box = tf.reduce_sum((1.0 - iou) * weight) / tf.maximum(target_scores_sum, 1)
+
+            # L1 loss on image-normalized LTRB (replaces DFL cross-entropy)
+            # Compute target LTRB from anchor_points and target_bboxes
+            a_t, b_t = tf.split(target_bboxes, 2, axis=-1)
+            target_ltrb = tf.concat([anchor_points - a_t, b_t - anchor_points], axis=-1)  # (B, A, 4)
+
+            # Scale to pixel space, then normalize by image dimensions
+            target_ltrb_px = target_ltrb * stride_tensor  # (B, A, 4)
+            pred_ltrb_px = pred_output * stride_tensor     # (B, A, 4)
+
+            # Normalize: columns 0,2 by width; columns 1,3 by height
+            # Build normalization factor dynamically (imgsz_w/h are TF tensors)
+            norm_vec = tf.cast(
+                tf.reshape(
+                    tf.stack([1.0 / imgsz_w, 1.0 / imgsz_h, 1.0 / imgsz_w, 1.0 / imgsz_h]),
+                    [1, 1, 4]
+                ),
+                self.dtype_
+            )
+            target_ltrb_norm = target_ltrb_px * norm_vec
+            pred_ltrb_norm = pred_ltrb_px * norm_vec
+
+            fg_pred = tf.boolean_mask(pred_ltrb_norm, fg_mask)     # (n_fg, 4)
+            fg_target = tf.boolean_mask(target_ltrb_norm, fg_mask)  # (n_fg, 4)
+
+            loss_l1_per = tf.reduce_mean(tf.abs(fg_pred - fg_target), axis=-1, keepdims=True) * weight
+            loss_l1 = tf.reduce_sum(loss_l1_per) / tf.maximum(target_scores_sum, 1)
+
+        loss_cls *= self.params['cls']
+        loss_box *= self.params['box']
+        loss_l1 *= self.params['dfl']   # reuse 'dfl' gain key for L1
+        return loss_cls + loss_box + loss_l1
+
+    def assign(self, pred_scores, pred_bboxes, true_labels, true_bboxes,
+               true_mask, anchors):
+        """
+        Task-aligned assigner with optional topk2 for one-to-one matching.
+
+        topk2 < topk: after resolving multi-GT conflicts, apply a secondary
+        top-k filter (topk2 anchors per GT). With topk2=1 this enforces
+        strict one-to-one matching (no NMS needed at inference).
+
+        Mirrors ultralytics TaskAlignedAssigner.select_highest_overlaps lines 346-352.
+        """
+        self.bs = tf.shape(pred_scores)[0]
+        self.num_max_boxes = tf.shape(true_bboxes)[1]
+
+        if tf.equal(self.num_max_boxes, 0):
+            return (
+                tf.zeros_like(pred_bboxes),
+                tf.zeros_like(pred_scores),
+                tf.cast(tf.zeros_like(pred_scores[..., 0]), tf.bool)
+            )
+
+        i0 = tf.tile(
+            tf.reshape(tf.range(self.bs, dtype=tf.int64), (-1, 1)),
+            [1, self.num_max_boxes]
+        )
+        i1 = tf.cast(tf.squeeze(true_labels, -1), tf.int64)
+
+        overlaps = self.compute_iou(
+            tf.expand_dims(true_bboxes, 2),
+            tf.expand_dims(pred_bboxes, 1)
+        )
+        overlaps = tf.clip_by_value(tf.squeeze(overlaps, 3), 0.0, 1.0)
+
+        scores_cls = tf.gather(pred_scores, i1, axis=2, batch_dims=1)
+        scores_cls = tf.transpose(scores_cls, [0, 2, 1])
+        align_metric = tf.pow(scores_cls, self.alpha) * tf.pow(overlaps, self.beta)
+
+        bs = tf.shape(true_bboxes)[0]
+        n_boxes = tf.shape(true_bboxes)[1]
+        anchors_exp = tf.expand_dims(anchors, 0)
+        lt, rb = tf.split(tf.reshape(true_bboxes, [-1, 1, 4]), 2, axis=-1)
+        bbox_deltas = tf.concat([anchors_exp - lt, rb - anchors_exp], axis=2)
+        bbox_deltas = tf.reshape(bbox_deltas, [bs, n_boxes, -1, 4])
+        mask_in_gts = tf.reduce_min(bbox_deltas, axis=-1) > 1e-9
+
+        metrics = align_metric * tf.cast(mask_in_gts, align_metric.dtype)
+        top_k_mask = tf.tile(tf.cast(true_mask, tf.bool), [1, 1, self.tal_topk])
+
+        num_anchors = tf.shape(metrics)[-1]
+        top_k_metrics, top_k_indices = tf.math.top_k(metrics, k=self.tal_topk, sorted=True)
+        top_k_indices = tf.where(top_k_mask, top_k_indices, tf.zeros_like(top_k_indices))
+
+        is_in_top_k = tf.reduce_sum(
+            tf.one_hot(top_k_indices, num_anchors, dtype=tf.int32), axis=-2
+        )
+        is_in_top_k = tf.where(is_in_top_k > 1, 0, is_in_top_k)
+        mask_top_k = tf.cast(is_in_top_k, metrics.dtype)
+
+        mask_pos = (mask_top_k
+                    * tf.cast(mask_in_gts, mask_top_k.dtype)
+                    * tf.cast(true_mask, mask_top_k.dtype))
+
+        fg_mask = tf.reduce_sum(mask_pos, axis=1)
+
+        # Resolve anchors assigned to multiple GTs
+        if tf.reduce_max(fg_mask) > 1:
+            mask_multi_gts = tf.tile(
+                tf.expand_dims(fg_mask > 1, 1), [1, self.num_max_boxes, 1]
+            )
+            max_overlaps_idx = tf.argmax(overlaps, axis=1)
+            is_max_overlaps = tf.one_hot(max_overlaps_idx, self.num_max_boxes,
+                                         dtype=mask_pos.dtype)
+            is_max_overlaps = tf.transpose(is_max_overlaps, [0, 2, 1])
+            mask_pos = tf.where(mask_multi_gts, is_max_overlaps, mask_pos)
+            fg_mask = tf.reduce_sum(mask_pos, axis=1)
+
+        # Secondary top-k filter for one-to-one matching (topk2=1 -> strict 1:1)
+        if self.tal_topk2 is not None and self.tal_topk2 != self.tal_topk:
+            align_metric_masked = align_metric * mask_pos  # (B, N, A)
+            # top-k2 indices across anchor dimension per GT
+            topk2_vals, topk2_idx = tf.math.top_k(
+                align_metric_masked, k=self.tal_topk2, sorted=True
+            )  # (B, N, topk2)
+            topk2_mask = tf.reduce_sum(
+                tf.one_hot(topk2_idx, num_anchors, dtype=mask_pos.dtype), axis=-2
+            )  # (B, N, A)
+            mask_pos = mask_pos * topk2_mask
+            fg_mask = tf.reduce_sum(mask_pos, axis=1)
+
+        target_gt_idx = tf.argmax(mask_pos, axis=1)
+
+        batch_indices = tf.range(self.bs, dtype=tf.int64)
+        batch_indices = tf.expand_dims(batch_indices, axis=1)
+        batch_indices = tf.tile(batch_indices, [1, tf.shape(target_gt_idx)[1]])
+        gather_indices = tf.stack([batch_indices, target_gt_idx], axis=2)
+
+        target_labels = tf.gather_nd(true_labels, gather_indices)
+        target_bboxes = tf.gather_nd(true_bboxes, gather_indices)
+
+        target_labels_clamped = tf.clip_by_value(target_labels, 0, self.nc - 1)
+        target_scores = tf.one_hot(
+            tf.cast(target_labels_clamped, tf.int32), self.nc, dtype=tf.float32
+        )
+
+        fg_scores_mask = tf.tile(tf.expand_dims(fg_mask > 0, -1), [1, 1, self.nc])
+        if len(target_scores.shape) == 4 and target_scores.shape[-1] == 1:
+            target_scores = tf.squeeze(target_scores, axis=-1)
+        if len(fg_scores_mask.shape) == 4 and fg_scores_mask.shape[-1] == 1:
+            fg_scores_mask = tf.squeeze(fg_scores_mask, axis=-1)
+        fg_scores_mask = tf.broadcast_to(fg_scores_mask, tf.shape(target_scores))
+        target_scores = tf.where(fg_scores_mask, target_scores, 0.0)
+
+        align_metric *= mask_pos
+        pos_align_metrics = tf.reduce_max(align_metric, axis=-1, keepdims=True)
+        pos_overlaps = tf.reduce_max(overlaps * mask_pos, axis=-1, keepdims=True)
+        norm_align_metric = tf.reduce_max(
+            align_metric * pos_overlaps / (pos_align_metrics + self.eps),
+            axis=1, keepdims=False
+        )
+        norm_align_metric = tf.expand_dims(norm_align_metric, axis=-1)
+        target_scores = target_scores * norm_align_metric
+
+        return target_bboxes, target_scores, tf.cast(fg_mask > 0, tf.bool)
+
+    def compute_iou(self, box1, box2, eps=1e-7):
+        """CIoU -- identical to ComputeLoss.compute_iou."""
+        b1_x1, b1_y1, b1_x2, b1_y2 = tf.split(box1, 4, axis=-1)
+        b2_x1, b2_y1, b2_x2, b2_y2 = tf.split(box2, 4, axis=-1)
+
+        w1, h1 = b1_x2 - b1_x1, b1_y2 - b1_y1 + eps
+        w2, h2 = b2_x2 - b2_x1, b2_y2 - b2_y1 + eps
+
+        inter_w = tf.maximum(tf.minimum(b1_x2, b2_x2) - tf.maximum(b1_x1, b2_x1), 0.0)
+        inter_h = tf.maximum(tf.minimum(b1_y2, b2_y2) - tf.maximum(b1_y1, b2_y1), 0.0)
+        intersection = inter_w * inter_h
+        union = w1 * h1 + w2 * h2 - intersection + eps
+        iou = intersection / union
+
+        cw = tf.maximum(b1_x2, b2_x2) - tf.minimum(b1_x1, b2_x1)
+        ch = tf.maximum(b1_y2, b2_y2) - tf.minimum(b1_y1, b2_y1)
+        c2 = cw ** 2 + ch ** 2 + eps
+        rho2 = ((b2_x1 + b2_x2 - b1_x1 - b1_x2) ** 2 +
+                (b2_y1 + b2_y2 - b1_y1 - b1_y2) ** 2) / 4.0
+        v = (4.0 / (math.pi ** 2)) * tf.square(tf.atan(w2 / h2) - tf.atan(w1 / h1))
+        alpha_ciou = tf.stop_gradient(v / (v - iou + (1.0 + eps)))
+        return iou - (rho2 / c2 + v * alpha_ciou)
+
+
+def zeropower_via_newtonschulz5_tf(G, eps=1e-7):
+    """
+    Newton-Schulz orthogonalization of a 2D matrix G (TensorFlow port).
+
+    Runs 5 iterations of the quintic NS iteration:
+        A = X @ X.T
+        X = a*X + (b*A + c*A@A) @ X
+    with coefficients (a, b, c) = (3.4445, -4.7750, 2.0315).
+
+    Approximates UV^T from SVD(G) = USV^T. Scales to keep singular
+    values near 1, then restores original shape orientation.
+
+    Reference: ultralytics/optim/muon.py lines 9-56.
+    """
+    assert len(G.shape) == 2, "Input must be 2D"
+    X = tf.cast(G, tf.float32)
+    X = X / (tf.linalg.norm(X) + eps)
+    transposed = G.shape[0] is not None and G.shape[1] is not None and G.shape[0] > G.shape[1]
+    if transposed:
+        X = tf.transpose(X)
+    for _ in range(5):
+        A = X @ tf.transpose(X)
+        B = -4.7750 * A + 2.0315 * (A @ A)
+        X = 3.4445 * X + B @ X
+    if transposed:
+        X = tf.transpose(X)
+    return X
+
+
+def muon_update_tf(grad, momentum_var, beta=0.95, nesterov=True):
+    """
+    Muon optimizer update step (TensorFlow port).
+
+    Steps:
+      1. EMA: momentum = beta * momentum + (1-beta) * grad
+      2. Nesterov (optional): update = grad * (1-beta) + momentum * beta
+      3. Reshape 4D conv weights to 2D
+      4. Newton-Schulz orthogonalization
+      5. Scale by sqrt(max(1, out_dim/in_dim))
+
+    Args:
+        grad: gradient tensor (2D or 4D for conv)
+        momentum_var: tf.Variable holding the momentum buffer (modified in-place)
+        beta: EMA coefficient (default 0.95)
+        nesterov: use Nesterov acceleration (default True)
+
+    Returns:
+        update tensor with same shape as grad
+
+    Reference: ultralytics/optim/muon.py lines 59-96.
+    """
+    momentum_var.assign(momentum_var * beta + grad * (1.0 - beta))
+    if nesterov:
+        update = grad * (1.0 - beta) + momentum_var * beta
+    else:
+        update = momentum_var
+
+    original_shape = tf.shape(update)
+    if len(grad.shape) == 4:
+        # TF Conv2D kernel shape is (kH, kW, in_ch, out_ch) -- NHWC convention.
+        # Transpose to (out_ch, in_ch, kH, kW) before flattening so Newton-Schulz
+        # orthogonalizes along the output-channel axis (matching PyTorch behaviour).
+        out_ch = grad.shape[-1] if grad.shape[-1] is not None else tf.shape(grad)[-1]
+        update_2d = tf.reshape(tf.transpose(update, [3, 2, 0, 1]), [out_ch, -1])
+    else:
+        update_2d = update
+
+    update_ortho = zeropower_via_newtonschulz5_tf(update_2d)
+
+    # Scale: sqrt(max(1, rows/cols))
+    rows = tf.cast(tf.shape(update_2d)[0], tf.float32)
+    cols = tf.cast(tf.shape(update_2d)[1], tf.float32)
+    scale = tf.sqrt(tf.maximum(1.0, rows / cols))
+    update_ortho = update_ortho * scale
+
+    if len(grad.shape) == 4:
+        # Undo the (out, in, kH, kW) layout back to TF NHWC (kH, kW, in, out)
+        kh = grad.shape[0] if grad.shape[0] is not None else tf.shape(grad)[0]
+        in_ch = grad.shape[2] if grad.shape[2] is not None else tf.shape(grad)[2]
+        kw = grad.shape[1] if grad.shape[1] is not None else tf.shape(grad)[1]
+        update_ortho = tf.transpose(
+            tf.reshape(update_ortho, [out_ch, in_ch, kh, kw]),
+            [2, 3, 1, 0]  # (out, in, kH, kW) -> (kH, kW, in, out)
+        )
+
+    return update_ortho
+
+
+class MuSGDOptimizer:
+    """
+    TensorFlow/Keras port of MuSGD (ultralytics/optim/muon.py).
+
+    Hybrid optimizer for YOLO26-style training:
+    - Parameters with ndim >= 2 (kernels) receive a MUON update
+      (orthogonalized momentum direction) PLUS a standard SGD update.
+    - Biases, BN gamma/beta receive standard SGD with momentum only.
+
+    The two branches are scaled by `muon` and `sgd` factors:
+        p -= lr * muon * muon_update(grad)   # orthogonalized direction
+        p -= lr * sgd  * sgd_update(grad)    # classical momentum SGD
+
+    This matches the YOLO26 recipe: muon=0.2, sgd=1.0, nesterov=True,
+    momentum=0.937, weight_decay applied on SGD branch for Muon params.
+
+    Args:
+        model: Keras model (used to enumerate trainable_variables)
+        lr0: base learning rate
+        momentum: momentum coefficient (beta for Muon EMA, also SGD momentum)
+        weight_decay: L2 coefficient (applied on SGD branch for Muon params)
+        nesterov: use Nesterov acceleration (default True)
+        muon_scale: scaling factor for Muon update (default 0.2, YOLO26 value)
+        sgd_scale: scaling factor for SGD update  (default 1.0, YOLO26 value)
+
+    Reference: ultralytics/engine/trainer.py lines 987-1036,
+               ultralytics/optim/muon.py lines 99-251.
+    """
+
+    def __init__(self, model, lr0, momentum, weight_decay,
+                 nesterov=True, muon_scale=0.2, sgd_scale=1.0):
+        self.lr0 = lr0
+        self.momentum = momentum
+        self.weight_decay = weight_decay
+        self.nesterov = nesterov
+        self.muon_scale = muon_scale
+        self.sgd_scale = sgd_scale
+
+        # Categorize variables using id() for robust matching (mirrors ultralytics trainer.py g[0..3])
+        # Keys are Python id(var) -- unique per TF variable object, stable for lifetime of optimizer
+        self._muon_set = {}    # id(var) -> (var, muon_buf, sgd_buf) for ndim>=2 kernels
+        self._sgd_set  = {}    # id(var) -> (var, mom_buf) for biases/BN params
+
+        for var in model.trainable_variables:
+            vname = var.name.lower()
+            is_bias = vname.endswith('/bias:0')
+            is_bn = any(k in vname for k in ['/batch_normalization', '/bn', '_bn', '/batchnorm'])
+            if not is_bias and not is_bn and len(var.shape) >= 2:
+                muon_buf = tf.Variable(tf.zeros_like(var), trainable=False,
+                                       name=f'muon_buf/{var.name}')
+                sgd_buf  = tf.Variable(tf.zeros_like(var), trainable=False,
+                                       name=f'sgd_buf/{var.name}')
+                self._muon_set[id(var)] = (var, muon_buf, sgd_buf)
+            else:
+                mom_buf = tf.Variable(tf.zeros_like(var), trainable=False,
+                                      name=f'mom_buf/{var.name}')
+                self._sgd_set[id(var)] = (var, mom_buf)
+
+        # Per-group learning rates (set via set_learning_rates)
+        self.lr_muon = lr0
+        self.lr_sgd  = lr0
+
+    def set_learning_rates(self, lr_bias, lr_weight, lr_bn):
+        """Mirror MultiGroupOptimizer API for drop-in use in warmup schedule."""
+        self.lr_muon = lr_weight   # kernel LR for Muon params
+        self.lr_sgd  = lr_bias     # bias/BN LR
+
+    def apply_gradients(self, gradients_and_vars):
+        """
+        Apply one step of MuSGD.
+
+        Iterates directly over (grad, var) pairs -- no name-based lookup,
+        so there is no risk of shape mismatches from variable name collisions.
+        """
+        for grad, var in gradients_and_vars:
+            if grad is None:
+                continue
+            vid = id(var)
+
+            if vid in self._muon_set:
+                # --- Muon + SGD branch (2D+ kernels) ---
+                _, muon_buf, sgd_buf = self._muon_set[vid]
+                grad_f = tf.cast(grad, tf.float32)
+                lr = self.lr_muon
+
+                # Muon update: orthogonalized EMA-momentum direction
+                update_muon = muon_update_tf(grad_f, muon_buf,
+                                              beta=self.momentum,
+                                              nesterov=self.nesterov)
+                var.assign_sub(tf.cast(lr * self.muon_scale * update_muon, var.dtype))
+
+                # SGD update: classical momentum (weight decay on this branch)
+                if self.weight_decay != 0:
+                    wd_grad = grad_f + tf.cast(self.weight_decay * var, tf.float32)
+                else:
+                    wd_grad = grad_f
+                sgd_buf.assign(sgd_buf * self.momentum + wd_grad)
+                sgd_update = (wd_grad + sgd_buf * self.momentum
+                              if self.nesterov else sgd_buf)
+                var.assign_sub(tf.cast(lr * self.sgd_scale * sgd_update, var.dtype))
+
+            elif vid in self._sgd_set:
+                # --- Pure SGD branch (biases, BN) ---
+                _, mom_buf = self._sgd_set[vid]
+                grad_f = tf.cast(grad, tf.float32)
+                lr = self.lr_sgd
+                mom_buf.assign(mom_buf * self.momentum + grad_f)
+                update = (grad_f + mom_buf * self.momentum
+                          if self.nesterov else mom_buf)
+                var.assign_sub(tf.cast(lr * update, var.dtype))
+
+
+class E2ELoss:
+    """
+    End-to-end training loss for YOLO26-style models.
+
+    Wraps two ComputeLossNoDFL instances:
+      - one2many (tal_topk=10): relaxed assignment, trains backbone richly
+      - one2one  (tal_topk=7, tal_topk2=1): strict one-to-one, trains the
+        inference head so no NMS is needed at test time
+
+    Total loss = o2m_weight * L_one2many + o2o_weight * L_one2one
+
+    o2m_weight starts at 0.8 and decays linearly to final_o2m=0.1 over
+    training, mimicking the ultralytics E2ELoss schedule.
+
+    Call update() at the end of each epoch.
+
+    Args:
+        model: Keras model (metadata: nc, dfl_ch, stride)
+        params: hyperparameter dict (box, cls, dfl gain keys; optionally 'epochs')
+        epochs: total training epochs (used for decay schedule)
+        dtype: computation dtype
+    """
+
+    def __init__(self, model, params, epochs=500, dtype=tf.float32):
+        self.one2many = ComputeLossNoDFL(model, params, dtype=dtype, tal_topk=10)
+        self.one2one  = ComputeLossNoDFL(model, params, dtype=dtype,
+                                          tal_topk=7, tal_topk2=1)
+        self.total = 1.0
+        self._o2m_init = 0.8
+        self.o2m = self._o2m_init
+        self.o2o = self.total - self.o2m
+        self.final_o2m = 0.1
+        self.epochs = epochs
+        self.step = 0   # counts completed epochs
+
+    def __call__(self, preds, targets, imgsz=None):
+        """
+        Compute weighted end-to-end loss.
+
+        Args:
+            preds: list/tuple [o2m_output, o2o_output] from dual-head model
+                   each of shape (B, H, W, 4+nc)
+            targets: (N, 6) flat target tensor [batch_idx, cls, x, y, w, h]
+            imgsz: optional (h, w) pixel size for LTRB normalization
+
+        Returns:
+            scalar combined loss
+        """
+        o2m_out, o2o_out = preds[0], preds[1]
+
+        # Note: stop_gradient is applied inside the model graph (o2o_detach layer),
+        # so backbone weights are only trained by o2m loss. The o2o head weights
+        # receive gradients from loss_o2o, which is the intended behaviour.
+        loss_o2m = self.one2many(o2m_out, targets, imgsz=imgsz)
+        loss_o2o = self.one2one(o2o_out, targets, imgsz=imgsz)
+        return loss_o2m * self.o2m + loss_o2o * self.o2o
+
+    def update(self):
+        """
+        Decay the one-to-many weight after each epoch.
+
+        Schedule: o2m decays linearly from 0.8 -> final_o2m=0.1 over all epochs.
+        Matches ultralytics E2ELoss.decay().
+        """
+        self.step += 1
+        decay = max(1.0 - self.step / max(self.epochs - 1, 1), 0.0)
+        self.o2m = decay * (self._o2m_init - self.final_o2m) + self.final_o2m
+        self.o2o = self.total - self.o2m

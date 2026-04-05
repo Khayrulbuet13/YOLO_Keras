@@ -3,7 +3,30 @@ import csv
 import math
 import os
 import random
+import subprocess
+import sys
 import numpy as np
+
+# --- GPU compatibility check (must run before TF uses GPU) ---
+# Test whether CuDNN is usable; if not, fall back silently to CPU-only.
+def _check_and_disable_gpu_if_incompatible():
+    """Run a lightweight Conv2D on GPU in a subprocess. Disable GPU if it fails."""
+    if os.environ.get('CUDA_VISIBLE_DEVICES') == '':
+        return  # already CPU-only
+    result = subprocess.run(
+        [sys.executable, '-c',
+         'import tensorflow as tf; '
+         'tf.nn.conv2d(tf.zeros([1,4,4,1]),tf.zeros([3,3,1,1]),strides=1,padding="SAME")'],
+        capture_output=True, timeout=30
+    )
+    if result.returncode != 0 and (b'DNN' in result.stderr or b'cudnn' in result.stderr.lower()):
+        print('[WARNING] CuDNN version mismatch detected -- falling back to CPU-only mode.')
+        print('[WARNING] To use GPU, install CuDNN >= 9.3.0 or use a compatible TensorFlow.')
+        os.environ['CUDA_VISIBLE_DEVICES'] = ''
+
+_check_and_disable_gpu_if_incompatible()
+# ---------------------------------------------------------------
+
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers, optimizers, callbacks
@@ -15,15 +38,23 @@ from tqdm import tqdm
 from nets.tinysimov35_keras import yolo_v8_s
 from nets.tinysimov35_keras_quantized_functional import yolo_v8_s_quantized_functional
 from nets.tinysimov35_keras_functional import yolo_v8_s_functional, decode_predictions
+from nets.tinysimov35_noDFL_keras_functional import (
+    build_yolo_e2e_functional,
+    decode_predictions_noDFL,
+    postprocess_e2e,
+)
 from utils.dataset_keras import Dataset
 from utils.util_keras import (
-    generate_colors, 
+    generate_colors,
     visualize_predictions,
     ComputeLoss,
+    ComputeLossNoDFL,
+    E2ELoss,
+    MuSGDOptimizer,
     EMA,
     AverageMeter,
     non_max_suppression,
-    compute_ap
+    compute_ap,
 )
 
 # Import QKeras utilities for quantized model handling
@@ -129,27 +160,23 @@ def train(args, params):
     if args.quantized:
         print("[INFO] Using quantized model (QKeras) for HLS4ml FPGA synthesis")
         model = yolo_v8_s_quantized_functional(num_classes, img_size=args.img_size, dtype=DTYPE)
-        
+
         # Transfer weights from float32 model if available
         if args.pretrained_weights:
             print(f"[INFO] Loading pre-trained weights from: {args.pretrained_weights}")
             float_model = yolo_v8_s_functional(num_classes, img_size=args.img_size, dtype=DTYPE)
             float_model.load_weights(args.pretrained_weights)
-            
+
             print("[INFO] Transferring weights from float32 to quantized model...")
             float_layer_dict = {layer.name: layer for layer in float_model.layers}
             transferred = 0
             skipped = 0
-            
+
             for qlayer in model.layers:
-                # Map quantized layer names to float32 layer names
-                # backbone_qconv1 -> backbone_conv1, etc.
                 float_name = qlayer.name.replace('qconv', 'conv').replace('qrelu', 'relu')
-                
                 if float_name in float_layer_dict:
                     flayer = float_layer_dict[float_name]
                     try:
-                        # Transfer weights if layer has them
                         if len(flayer.get_weights()) > 0:
                             qlayer.set_weights(flayer.get_weights())
                             print(f"  ✓ {flayer.name} -> {qlayer.name}")
@@ -157,14 +184,17 @@ def train(args, params):
                     except Exception as e:
                         print(f"  ⚠ Failed {flayer.name} -> {qlayer.name}: {e}")
                         skipped += 1
-            
+
             print(f"[INFO] Weight transfer complete: {transferred} layers transferred, {skipped} skipped")
             del float_model  # Free memory
+    elif args.e2e:
+        print("[INFO] Using YOLO26-style end-to-end model (no DFL, no NMS)")
+        model = build_yolo_e2e_functional(num_classes, img_size=args.img_size, dtype=DTYPE)
     elif args.functional:
         print("[INFO] Using functional API model for QKeras compatibility")
         model = yolo_v8_s_functional(num_classes, img_size=args.img_size, dtype=DTYPE)
     else:
-        model = yolo_v8_s(num_classes, img_size=args.img_size, dtype=DTYPE)  # Pass dtype to model
+        model = yolo_v8_s(num_classes, img_size=args.img_size, dtype=DTYPE)
     
     # Create model directory
     if args.local_rank == 0:
@@ -174,14 +204,26 @@ def train(args, params):
     accumulate = max(round(64 / (args.batch_size)), 1)
     params['weight_decay'] *= args.batch_size * accumulate / 64
 
-    # Use custom multi-group optimizer to match PyTorch behavior
-    optimizer = MultiGroupOptimizer(
-        model, 
-        params['lr0'], 
-        params['momentum'], 
-        params['weight_decay'], 
-        nesterov=True
-    )
+    # Use MuSGDOptimizer for e2e (YOLO26) mode, MultiGroupOptimizer otherwise
+    if args.e2e:
+        print("[INFO] Using MuSGD optimizer (YOLO26 hybrid Muon+SGD)")
+        optimizer = MuSGDOptimizer(
+            model,
+            lr0=params['lr0'],
+            momentum=params['momentum'],
+            weight_decay=params['weight_decay'],
+            nesterov=True,
+            muon_scale=0.2,   # YOLO26 trainer default: muon=0.2, sgd=1.0
+            sgd_scale=1.0,
+        )
+    else:
+        optimizer = MultiGroupOptimizer(
+            model,
+            params['lr0'],
+            params['momentum'],
+            params['weight_decay'],
+            nesterov=True,
+        )
 
     lr_func = learning_rate(args, params)
     
@@ -270,7 +312,10 @@ def train(args, params):
     ).prefetch(tf.data.AUTOTUNE)
     
     # Loss function with dtype
-    criterion = ComputeLoss(model, params, dtype=DTYPE)
+    if args.e2e:
+        criterion = E2ELoss(model, params, epochs=args.epochs, dtype=DTYPE)
+    else:
+        criterion = ComputeLoss(model, params, dtype=DTYPE)
     
     # Training loop
     best = 0
@@ -331,19 +376,23 @@ def train(args, params):
             # Forward pass
             with tf.GradientTape() as tape:
                 outputs = model(samples, training=True)
-                loss = criterion(outputs, targets)
-                
-                # Scale loss for multi-GPU (MATCH PYTORCH BEHAVIOR)
+                if args.e2e:
+                    # outputs is [o2m_output, o2o_output] -- E2ELoss handles both
+                    imgsz = tf.constant([args.img_size[0], args.img_size[1]], dtype=DTYPE)
+                    loss = criterion(outputs, targets, imgsz=imgsz)
+                else:
+                    loss = criterion(outputs, targets)
+
+                # Scale loss for multi-GPU (single-GPU: scale by batch_size)
                 loss *= args.batch_size
-                # Note: world_size not available in Keras args, using batch_size only for single-GPU
-                
+
                 m_loss.update(loss.numpy(), samples.shape[0])
 
             # Backward pass
             gradients = tape.gradient(loss, model.trainable_variables)
             
-            # Clip gradients for quantized and functional models to prevent explosion
-            if args.quantized or args.functional:
+            # Clip gradients for quantized, functional, and e2e models to prevent explosion
+            if args.quantized or args.functional or args.e2e:
                 gradients, global_norm = tf.clip_by_global_norm(gradients, 1.0)
             
             optimizer.apply_gradients(zip(gradients, model.trainable_variables))
@@ -355,6 +404,10 @@ def train(args, params):
             # Update progress bar
             p_bar.set_postfix({'loss': m_loss.avg})
 
+        # Decay E2ELoss one-to-many weight at end of each epoch
+        if args.e2e and hasattr(criterion, 'update'):
+            criterion.update()
+
         # Evaluation
         if args.local_rank == 0:
             # Create EMA model for evaluation if EMA is enabled
@@ -363,6 +416,8 @@ def train(args, params):
                 # Create a temporary model with EMA weights
                 if args.quantized:
                     eval_model = yolo_v8_s_quantized_functional(num_classes, img_size=args.img_size)
+                elif args.e2e:
+                    eval_model = build_yolo_e2e_functional(num_classes, img_size=args.img_size)
                 elif args.functional:
                     eval_model = yolo_v8_s_functional(num_classes, img_size=args.img_size)
                 else:
@@ -485,6 +540,8 @@ def test(args, params, model=None, is_train=False):
         model_path = os.path.join(args.save_path, 'best.weights.h5')
         if args.quantized:
             model = yolo_v8_s_quantized_functional(len(params['names']), img_size=args.img_size)
+        elif args.e2e:
+            model = build_yolo_e2e_functional(len(params['names']), img_size=args.img_size)
         elif args.functional:
             model = yolo_v8_s_functional(len(params['names']), img_size=args.img_size)
         else:
@@ -501,15 +558,18 @@ def test(args, params, model=None, is_train=False):
     vis_count = 0
 
     for samples, targets, shapes in tqdm(loader, desc='Evaluating'):
-        outputs = model(samples, training=False)
-        
-        # Decode predictions if using functional model (outputs raw features)
-        # Functional model outputs (B, H, W, 65) vs subclassed outputs (B, HW, 5)
-        if len(outputs.shape) == 4:
-            # Functional model: decode raw predictions
-            outputs = decode_predictions(outputs, model.stride, model.nc, model.dfl_ch, dtype=DTYPE)
-        
-        detections = non_max_suppression(outputs, 0.25, 0.45)
+        if args.e2e:
+            # Dual-head model: use one-to-one output for inference (no NMS)
+            o2m_out, o2o_out = model(samples, training=False)
+            decoded = decode_predictions_noDFL(o2o_out, model.stride, model.nc, dtype=DTYPE)
+            detections = postprocess_e2e(decoded, max_det=300, conf_threshold=0.25, dtype=DTYPE)
+        else:
+            outputs = model(samples, training=False)
+            # Decode predictions if using functional model (outputs raw features)
+            # Functional model outputs (B, H, W, 4*dfl_ch+nc); subclassed outputs (B, HW, 4+nc)
+            if len(outputs.shape) == 4:
+                outputs = decode_predictions(outputs, model.stride, model.nc, model.dfl_ch, dtype=DTYPE)
+            detections = non_max_suppression(outputs, 0.25, 0.45)
         
         # Scale GT coordinates from normalized to pixel space (matching PyTorch line 416)
         _, h, w, _ = samples.shape
@@ -643,6 +703,7 @@ def test(args, params, model=None, is_train=False):
                 # Simplified IoU calculation
                 for j in range(len(iou_v)):
                     iou_threshold = iou_v[j]
+                    matched_gt = set()  # track GT boxes already matched at this IoU threshold
                     
                     # For each detection, find best matching ground truth
                     for det_idx in range(det_clone.shape[0]):
@@ -653,6 +714,8 @@ def test(args, params, model=None, is_train=False):
                         best_gt_idx = -1
                         
                         for gt_idx in range(len(t_tensor)):
+                            if gt_idx in matched_gt:
+                                continue
                             gt_box = t_tensor[gt_idx, 1:5]
                             gt_class = t_tensor[gt_idx, 0]
                             
@@ -675,8 +738,9 @@ def test(args, params, model=None, is_train=False):
                                         best_iou = iou
                                         best_gt_idx = gt_idx
                         
-                        if best_iou >= iou_threshold:
+                        if best_iou >= iou_threshold and best_gt_idx >= 0:
                             correct[det_idx, j] = True
+                            matched_gt.add(best_gt_idx)  # prevent re-matching this GT
                 
                 # Gather conf, pred_cls, true_cls
                 conf = det_clone[:, 4]
@@ -717,6 +781,7 @@ def main():
     parser.add_argument('--test', action='store_true')
     parser.add_argument('--quantized', action='store_true', help='Use QKeras quantized model for HLS4ml FPGA synthesis')
     parser.add_argument('--functional', action='store_true', help='Use Keras Functional API model (QKeras compatible)')
+    parser.add_argument('--e2e', action='store_true', help='Use YOLO26-style end-to-end model (no DFL, no NMS)')
     parser.add_argument('--pretrained-weights', type=str, default=None, help='Path to pre-trained float32 weights for quantized model initialization (e.g., best_float32.h5)')
     parser.add_argument('--yaml_file', type=str, default='utils/args_bionano.yaml')
     parser.add_argument('--save-path', type=str, default='./results/rect_256x128_cleaned')
